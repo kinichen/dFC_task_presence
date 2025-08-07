@@ -1,0 +1,17 @@
+dFC_task_presence
+name = "dfc-task-presence"
+version = "0.1.0"
+description = "Exploratory project to improve classification of task and rest time points using dFC data"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.1.2",
+    "pillow>=11.0.0",
+    "pyyaml>=6.0.2",
+    "scikit-learn>=1.7.1",
+    "timm>=1.0.19",
+    "torch>=2.7.1",
+    "torch-geometric>=2.6.1",
+    "torchaudio>=2.7.1",
+    "torchvision>=0.22.1",
+]
