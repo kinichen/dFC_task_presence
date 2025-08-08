@@ -1,4 +1,6 @@
-# utilities/my_utils.py
+import math
+import numpy as np
+
 
 
 def get_n_ROI(a, b, c): # solves quadratic in ax**2+bx+c=0 form.
@@ -20,9 +22,9 @@ def get_n_ROI(a, b, c): # solves quadratic in ax**2+bx+c=0 form.
 			return ValueError(f"Number of ROIs = {root2} is not an integer")
 
 
-def vec_to_symmetric_matrix(vec):
-	mat = np.zeros((ROI, ROI))
-	idx = np.triu_indices(ROI, k=1)
+def vec_to_symmetric_matrix(vec, roi):
+	mat = np.zeros((roi, roi))
+	idx = np.triu_indices(roi, k=1)	# excludes diagonal
 	mat[idx] = vec
 	mat = mat + mat.T
 	return mat
