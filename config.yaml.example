@@ -1,3 +1,11 @@
-simulation_filepath: "~/dFC_task_presence/Datasets/Simulated_data/ds000002_task-lowFreqLongRest_Time-Freq.npy"
-real_filepath: "~/dFC_task_presence/Datasets/ds003465_task-Axcpt_Time-Freq.npy"
-atlas_filepath: "~/dFC_task_presence/Datasets/atlas_data.npy"
+datasets:
+  sim_timefreq:  # simulated dFC dataset assessed by time frequency method
+    path: "~/projects/dFC_task_presence/Datasets/Simulated_data/ds000002_task-lowFreqLongRest_Time-Freq.npy"
+  
+  real_timefreq: 
+    path: "~/projects/dFC_task_presence/Datasets/ds003465_task-Axcpt_Time-Freq.npy"
+  
+  atlas_real: 
+    path: "~/projects/dFC_task_presence/Datasets/atlas_data.npy"
+
+  # training: # May add training hyperparameters here later
