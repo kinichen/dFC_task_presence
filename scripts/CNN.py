@@ -12,7 +12,7 @@ import torch.optim as optim
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 
 import sys
-import yaml
+from utilities.utils import get_n_ROI, vec_to_symmetric_matrix
 
 
 def run(config):
@@ -34,35 +34,7 @@ def run(config):
 
     print(f"X Dataset loaded with shape: {X.shape}")
 
-
-    # Utility functions
-
-    def get_n_ROI(a, b, c): # solves quadratic in ax**2+bx+c=0 form.
-        discriminant = b**2 - 4*a*c
-        if discriminant < 0:
-            return ValueError("No real roots")
-        root1 = (-b + math.sqrt(discriminant)) / (2*a)  # always returns a float
-        root2 = (-b - math.sqrt(discriminant)) / (2*a)
-
-        if root1 > 0:
-            if root1.is_integer():
-                return int(root1)
-            else:
-                return ValueError(f"Number of ROIs = {root1} is not an integer")
-        else:
-            if root2.is_integer():
-                return int(root2)
-            else:
-                return ValueError(f"Number of ROIs = {root2} is not an integer")
-
     ROI = get_n_ROI(1, -1, -2 * X.shape[1])  # solves quadratic equation for number of ROIs
-
-    def vec_to_symmetric_matrix(vec):
-        mat = np.zeros((ROI, ROI))
-        idx = np.triu_indices(ROI, k=1)
-        mat[idx] = vec
-        mat = mat + mat.T
-        return mat
 
 
     # Using pre-trained model EfficientNet-B0 from torchvision
@@ -125,7 +97,7 @@ def run(config):
             label = self.y[idx]
 
             # Convert to symmetric matrix on the fly to save memory
-            dfc_matrix = vec_to_symmetric_matrix(vec)
+            dfc_matrix = vec_to_symmetric_matrix(vec, ROI)
             # Convert to (3, 224, 224) tensor
             tensor_img = preprocess_dfc_matrix(dfc_matrix)
 

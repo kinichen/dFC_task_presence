@@ -29,7 +29,8 @@ def run(config):
     method = dFC_dict["measure_name"]
 
     print(f"X Dataset loaded with shape: {X.shape}")
-
+    
+    ROI = get_n_ROI(1, -1, -2 * X.shape[1])
 
     def dfc_to_graph(dfc_matrix, label):
         """
@@ -67,8 +68,7 @@ def run(config):
             label = self.y[idx]
 
             # Convert vector to symmetric matrix
-            roi = get_n_ROI(1, -1, -2 * X.shape[1])
-            dfc_matrix = vec_to_symmetric_matrix(vec, roi)
+            dfc_matrix = vec_to_symmetric_matrix(vec, ROI)
 
             # Convert symmetric matrix to graph data object
             data = dfc_to_graph(dfc_matrix, label)
