@@ -13,10 +13,15 @@ from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import Subset
 
+import sys
+from utilities.utils import get_n_ROI, vec_to_symmetric_matrix, harmonize_TR, save_model
+
 import random
 import os
-import sys
-from utilities.utils import get_n_ROI, vec_to_symmetric_matrix, save_model
+
+#### This script builds a pretrained CNN using 3 datasets (dFC assessment methods) 
+#### as the 3 RBG image channels, testing whether differerently processed information
+#### improves classification
 
 
 def set_seed(seed): # for reproducibility
@@ -27,36 +32,36 @@ def set_seed(seed): # for reproducibility
         torch.cuda.manual_seed_all(seed)
 
 
-def run(config, dataset_name: list):
+def run(config, dataset_names: list):
     """
     Main function to run the script with the given configuration.
     
     Parameters:
-        config (dict): configuration parameters loaded from config.yaml
-        dataset_name (list): single element is the name of the dataset to be processed
+        config: dict, configuration parameters loaded from config.yaml
+        dataset_names: list of str, names of the 3 datasets to be processed
     """
     model_config = config["models"]["CNN"]
-
     seed = model_config["training"].get("seed", 42)
     set_seed(seed)
+    
+    if len(dataset_names) != 3:
+        raise ValueError("This script is designed to work with exactly 3 datasets", 
+                         "representing 1 task paradigm assessed by 3 methods")
 
     ########################## 1. Load dataset #################################
-    # Loading dataset for 1 task paradigm assessed by 1 method for all subjects (1 run)
-    dataset_name = dataset_name[0]  # get the string out
-    my_filepath = config['datasets'][dataset_name]['path']
-    print(f"Loading dataset from: {my_filepath}")
+    datasets_list = []
+    for dataset in dataset_names:
+        my_filepath = config['datasets'][dataset]['path']
+        print(f"Loading dataset from: {my_filepath}")
     
-    dFC = np.load(my_filepath, allow_pickle=True)
-    dFC_dict = dFC.item()
+        dFC_dict = np.load(my_filepath, allow_pickle=True).item()
+        datasets_list.append(dFC_dict)
 
-    X = dFC_dict["X"]
-    y = dFC_dict["y"]
-    subj_label = dFC_dict["subj_label"]
-    method = dFC_dict["measure_name"]
+        X = dFC_dict["X"]
+        print(f"{dataset} - X loaded with shape: {X.shape}")
 
-    print(f"X Dataset loaded with shape: {X.shape}")
-
-    ROI = get_n_ROI(1, -1, -2 * X.shape[1])  # solves quadratic equation for number of ROIs
+    ROI = get_n_ROI(1, -1, -2 * datasets_list[0]["X"].shape[1])  # solves quadratic equation for number of ROIs
+    # assume all datasets had same number of ROIs, so we can use the first one
 
 
     ######################### 2. Transformations ################################
@@ -75,25 +80,27 @@ def run(config, dataset_name: list):
         transforms.Normalize(mean=imagenet_mean, std=imagenet_std)  # Normalize as ImageNet
     ])
 
-    def preprocess_dfc_matrix(dfc_matrix):
+    def preprocess_dfc_matrix(dfc_matrices: list):
         """
-        Convert a single-channel dFC matrix to a 3-channel 224x224 tensor.
-
+        Convert three dFC matrices into a 3-channel 224x224 tensor.
+        
         Parameters:
-            dfc_matrix: np.ndarray of shape (H, W)
+            dfc_matrices: list of 3 np.ndarray, each of shape (H, W)
 
         Returns:
-            torch.Tensor of shape (3, 224, 224) ready for CNN (EfficientNet-B0) input.
+            torch.Tensor of shape (3, 224, 224) ready for CNN input.
         """
+        # Normalize each matrix independently to 0–1 range
+        norm_mats = []
+        for mat in dfc_matrices:
+            mat_norm = (mat - np.min(mat)) / (np.max(mat) - np.min(mat) + 1e-8)
+            norm_mats.append(mat_norm)
 
-        # Normalize matrix to 0–1 range (optional actually)
-        dfc_norm = (dfc_matrix - np.min(dfc_matrix)) / (np.max(dfc_matrix) - np.min(dfc_matrix) + 1e-8)
+        # Stack to make (H, W, 3) tensor
+        dfc_3channel = np.stack(norm_mats, axis=-1)
 
-        # Convert to 3 channels manually by stacking for pre-trained image model compatibility
-        dfc_3channel = np.stack([dfc_norm]*3, axis=-1)  # shape (H, W, 3)
-
-        # Apply torchvision transform
-        tensor_img = dfc_transform(dfc_3channel)  # (3, 224, 224)
+        # Apply transforms to get shape (3, 224, 224)
+        tensor_img = dfc_transform(dfc_3channel)
 
         return tensor_img
 
@@ -103,39 +110,46 @@ def run(config, dataset_name: list):
     # to train the data batch by batch
 
     class dFCDataset(Dataset):
-        def __init__(self, X, y):
+        def __init__(self, harmonized: list):
             """
             Parameters:
-                X: 2D numpy array of shape (n_samples, num_features)
-                y: 1D array-like of binary labels
+                harmonized: list of three dictionaries with TR harmonized across methods
             """
-            self.X = X
-            self.y = y
+            self.datasets = harmonized
+            # harmonizing ensured samples are the same across datasets/methods
+            self.n_samples = len(self.datasets[0]['X'])
+            self.y = harmonized[0]['y']  # labels are aligned, so the same
 
         def __len__(self):
             return len(self.y)
 
-        def __getitem__(self, idx):
-            vec = self.X[idx]
-            label = self.y[idx]
+        def __getitem__(self, idx): # idx of the sample to retrieve
 
-            # Convert to symmetric matrix on the fly to save memory
-            dfc_matrix = vec_to_symmetric_matrix(vec, ROI)
+            # Convert to symmetric matrices for a single sample
+            dFC_matrices = [
+                vec_to_symmetric_matrix(self.datasets[i]['X'][idx], ROI)
+                for i in range(len(self.datasets))
+            ]
+            
             # Convert to (3, 224, 224) tensor
-            tensor_img = preprocess_dfc_matrix(dfc_matrix)
+            tensor_img = preprocess_dfc_matrix(dFC_matrices)
 
-            return tensor_img, float(label)
+            return tensor_img, float(self.y[idx])
 
-    dataset = dFCDataset(X, y)  # full transformed dataset to be split in CV
+    # Same data assessed by different dFC methods gives different number of dFC 
+    # time points, so need to harmonize the samples before stacking across methods/datasets
+    harmonized_datasets = harmonize_TR(datasets_list)
+    print("Harmonized X.shape:", harmonized_datasets[0]['X'].shape)
+    ds = dFCDataset(harmonized_datasets)  # full transformed dataset to be split in CV
     
     ############### 4. Training with CV ######################
     # Create DataLoaders for training and testing
     def train_one_fold(train_idx, test_idx, fold):
         # Create loaders
-        train_loader = DataLoader(Subset(dataset, train_idx),
+        train_loader = DataLoader(Subset(ds, train_idx),
                                   batch_size=model_config['training']['batch_size'],
                                   shuffle=True) # shuffle at each epoch for generalizability
-        test_loader = DataLoader(Subset(dataset, test_idx),
+        test_loader = DataLoader(Subset(ds, test_idx),
                                  batch_size=model_config['training']['batch_size'],
                                  shuffle=False)
 
@@ -157,11 +171,12 @@ def run(config, dataset_name: list):
         # print("Memory allocated:", torch.cuda.memory_allocated())
 
         # Loss function adjusted for class imbalance
+        y = ds.y
         y_train_subset = y[train_idx]
         num_task = (y_train_subset == 1).sum()
         num_rest = (y_train_subset == 0).sum()
         pos_weight = torch.tensor([num_rest / num_task], dtype=torch.float32).to(device)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight) # penalize false negatives more
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
         # Optimizer
         if model_config['training']['optimizer'] == 'adam':
@@ -214,6 +229,9 @@ def run(config, dataset_name: list):
     k = model_config['training']['k_folds']
     skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
     acc_scores, auc_scores = [], []
+    
+    X = ds.datasets[0]['X']  # Use the first dataset's X for stratification indices
+    y = ds.y  # Labels are the same across datasets after harmonization
     for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), start=1):
         acc, auc = train_one_fold(train_idx, test_idx, fold=fold)
         acc_scores.append(acc)
@@ -230,7 +248,7 @@ def run(config, dataset_name: list):
         print("Retraining on the full dataset to produce final model...")
         
         # Full dataset loader
-        full_loader = DataLoader(dataset, batch_size=model_config['training']['batch_size'], shuffle=True)
+        full_loader = DataLoader(ds, batch_size=model_config['training']['batch_size'], shuffle=True)
 
         # Load a fresh model
         final_model = timm.create_model(model_config['name'], pretrained=True)
@@ -241,6 +259,7 @@ def run(config, dataset_name: list):
         final_model.to(device)
 
         # Loss function (class imbalance)
+        y = ds.y
         num_task = (y == 1).sum()
         num_rest = (y == 0).sum()
         pos_weight = torch.tensor([num_rest / num_task], dtype=torch.float32).to(device)
@@ -267,5 +286,6 @@ def run(config, dataset_name: list):
             print(f"[Full Dataset] Epoch {epoch+1} Train Loss: {total_loss/len(full_loader):.3f}")
 
         # Save final model
-        final_model_path = os.path.join(model_config['output_dir'], f"model-{dataset_name}.pth")
+        paradigm = dataset_names[0].split('_')[0]  # Extract paradigm from dataset name
+        final_model_path = os.path.join(model_config['output_dir'], f"model-{paradigm}-multichannel.pth")
         save_model(final_model, final_model_path)
