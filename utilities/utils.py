@@ -1,9 +1,6 @@
 import math
 import numpy as np
 import pandas as pd
-import os
-import torch
-
 
 
 def get_n_ROI(a, b, c): # solves quadratic in ax**2+bx+c=0 form.
@@ -78,11 +75,9 @@ def harmonize_TR(datasets: list):
     for i in range(1, len(harmonized)):
         assert np.array_equal(harmonized[0]["y"], harmonized[i]["y"]), \
             "Mismatch in y labels after harmonization. Bad!!"
+        assert np.array_equal(harmonized[0]["subj_label"], harmonized[i]["subj_label"]), \
+            "Mismatch in subject labels after harmonization. Bad!!"
+        assert np.array_equal(harmonized[0]["TR_labels"], harmonized[i]["TR_labels"]), \
+            "Mismatch in TR labels after harmonization. Bad!!"
 
     return harmonized
-
-
-def save_model(model, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(model.state_dict(), path)
-    print(f"Final model saved to {path}")
