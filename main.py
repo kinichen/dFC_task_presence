@@ -2,7 +2,7 @@ import yaml
 import importlib
 
 ####### CHANGE THIS PART TO RUN DIFFERENT SCRIPTS/DATASETS #######
-SCRIPT_TO_RUN = "GCN"   # no .py extension
+SCRIPT_TO_RUN = "CNN"   # no .py extension
 
 # See config.yaml for available datasets
 # Either specify a single dataset (e.g., ["sim_lflr_tf"]), or

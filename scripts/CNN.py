@@ -1,30 +1,18 @@
-import math
 import torch
 import numpy as np
 from torchvision import transforms
 from PIL import Image
 import torch.nn as nn
 
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 import timm		# access to pretrained image classification models
 import torch.optim as optim
-from sklearn.metrics import balanced_accuracy_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
-from torch.utils.data import Subset
 
-import random
 import os
-import sys
-from utilities.utils import get_n_ROI, vec_to_symmetric_matrix, save_model
-
-
-def set_seed(seed): # for reproducibility
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+from utilities.utils import get_n_ROI, vec_to_symmetric_matrix
+from utilities.train_utils import set_seed, load_dataset, \
+    build_dataloaders, make_class_weight, evaluate_convolutional, \
+    cross_validation_control, save_model
 
 
 def run(config, dataset_name: list):
@@ -36,30 +24,18 @@ def run(config, dataset_name: list):
         dataset_name (list): single element is the name of the dataset to be processed
     """
     model_config = config["models"]["CNN"]
-
-    seed = model_config["training"].get("seed", 42)
+    train_config = model_config["training"]
+    
+    seed = train_config.get("seed", 42)
     set_seed(seed)
 
     ########################## 1. Load dataset #################################
     # Loading dataset for 1 task paradigm assessed by 1 method for all subjects (1 run)
     dataset_name = dataset_name[0]  # get the string out
-    my_filepath = config['datasets'][dataset_name]['path']
-    print(f"Loading dataset from: {my_filepath}")
-    
-    dFC = np.load(my_filepath, allow_pickle=True)
-    dFC_dict = dFC.item()
-
-    X = dFC_dict["X"]
-    y = dFC_dict["y"]
-    subj_label = dFC_dict["subj_label"]
-    method = dFC_dict["measure_name"]
-
-    print(f"X Dataset loaded with shape: {X.shape}")
-
+    X, y, subj_label, method = load_dataset(dataset_name, config)
     ROI = get_n_ROI(1, -1, -2 * X.shape[1])  # solves quadratic equation for number of ROIs
 
-
-    ######################### 2. Transformations ################################
+    #################### 2. CNN Model Transformations ##########################
 
     # ImageNet normalization values
     imagenet_mean = [0.485, 0.456, 0.406]
@@ -97,10 +73,9 @@ def run(config, dataset_name: list):
 
         return tensor_img
 
-
     #################### 3. Dataset Class ################################
     # Wrap my data into a PyTorch Dataset class to make compatible with DataLoader
-    # to train the data batch by batch
+    # to train the data batch by batch for each epoch
 
     class dFCDataset(Dataset):
         def __init__(self, X, y):
@@ -128,55 +103,54 @@ def run(config, dataset_name: list):
 
     dataset = dFCDataset(X, y)  # full transformed dataset to be split in CV
     
-    ############### 4. Training with CV ######################
-    # Create DataLoaders for training and testing
-    def train_one_fold(train_idx, test_idx, fold):
-        # Create loaders
-        train_loader = DataLoader(Subset(dataset, train_idx),
-                                  batch_size=model_config['training']['batch_size'],
-                                  shuffle=True) # shuffle at each epoch for generalizability
-        test_loader = DataLoader(Subset(dataset, test_idx),
-                                 batch_size=model_config['training']['batch_size'],
-                                 shuffle=False)
+    ######################## 4. Training with CV ##############################
+    def train_one_fold(train_idx, val_idx, test_idx, fold, params):
+        '''
+        Train the model for one outer fold of cross-validation.
+        Parameters:
+            train_idx: indices for training set
+            val_idx: indices for validation set
+            test_idx: indices for test set
+            fold: current fold number
+            params: dictionary of one combination of training parameters
+        '''
+        # Build dataloaders
+        dataloaders = build_dataloaders(
+            dataset,
+            train_idx,
+            val_idx,
+            test_idx,
+            gcn_mode=False,  # CNN mode
+            batch_size=params['batch_size']
+        )
+        train_loader = dataloaders["train"]
+        val_loader = dataloaders["val"]
+        test_loader = dataloaders["test"]
 
-        # Load pre-trained model
-        model = timm.create_model(model_config['name'], pretrained=True)
+        ####### Setup device, pre-trained model, and optimizer #######
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # To check if GPU was used (connection to remote server was established):
+        # print("Using device:", torch.cuda.get_device_name(0))
+        # print("Memory allocated:", torch.cuda.memory_allocated())
         
+        model = timm.create_model(model_config['name'], pretrained=True)
         # Replace model's classifier with a new fully connected Linear layer to 
         # directly output a single value
         # Model backbone outputs shape: (batch_size, num_neurons) then
         # nn.Linear maps this to shape: (batch_size, 1) to compare against labels
         in_features = model.classifier.in_features
         model.classifier = nn.Linear(in_features, 1)  # binary classification
-        
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model.to(device)
-        # To check if GPU was used (connection to remote server was established):
-        # assert torch.cuda.is_available(), "CUDA not available"
-        # print("Using device:", torch.cuda.get_device_name(0))
-        # print("Memory allocated:", torch.cuda.memory_allocated())
-
+        optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
         # Loss function adjusted for class imbalance
-        y_train_subset = y[train_idx]
-        num_task = (y_train_subset == 1).sum()
-        num_rest = (y_train_subset == 0).sum()
-        pos_weight = torch.tensor([num_rest / num_task], dtype=torch.float32).to(device)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight) # penalize false negatives more
-
-        # Optimizer
-        if model_config['training']['optimizer'] == 'adam':
-            optimizer = optim.Adam(model.parameters(), lr=model_config['training']['lr'])
-        elif model_config['training']['optimizer'] == 'sgd':
-            optimizer = optim.SGD(model.parameters(), lr=model_config['training']['lr'], momentum=0.9)
-        else:
-            raise ValueError(f"Unsupported optimizer: {model_config['training']['optimizer']}")
-
+        pos_weight = make_class_weight(y[train_idx], device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        
         # Training loop
-        print("Beginning training loops...", flush=True)
-        for epoch in range(model_config['training']['epochs']):
+        for epoch in range(params['epochs']):
             model.train()   # set model to training mode (dropout, batchnorm, etc. 
-                # behave differently in train vs eval)
-            total_loss = 0  # accumulate loss over batches for average epoch loss
+                            # behave differently in train vs eval)
+            total_loss = 0  # accumulate loss over batches
             for batch_x, batch_y in train_loader: # batch_x.shape = (batch_size, 3, 224, 224)
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device).float().unsqueeze(1)
                 optimizer.zero_grad()   # zero the gradients accumulated before
@@ -186,74 +160,37 @@ def run(config, dataset_name: list):
                 optimizer.step()    # update model parameters using the gradients
                 total_loss += loss.item()
 
-            if fold == 1:  # print loss only for first fold to check trend
-                print(f"[Fold {fold}] Epoch {epoch+1} Train Loss: {total_loss/len(train_loader):.3f}")
+            if fold == 1:  # only for first fold to check trend
+                print(f"[Fold {fold}] Epoch {epoch+1} Train Loss: {total_loss/len(train_loader):.4f}")
 
-        # Evaluation
-        model.eval()
-        all_preds, all_probs, all_labels = [], [], []
-        with torch.no_grad():
-            for batch_x, batch_y in test_loader:
-                # unsqueeze to add a dimension for matching the output shape (batch_size, 1)
-                batch_x, batch_y = batch_x.to(device), batch_y.to(device).float().unsqueeze(1)
-                output = model(batch_x)
-                probs = torch.sigmoid(output)
-                preds = (probs > 0.5).float()
-                all_preds.extend(preds.cpu().numpy())
-                all_probs.extend(probs.cpu().numpy())
-                all_labels.extend(batch_y.cpu().numpy())
+        # Validation evaluation
+        _, val_auc = evaluate_convolutional(model, val_loader, device)
 
-        acc = balanced_accuracy_score(all_labels, all_preds)
-        auc = roc_auc_score(all_labels, all_probs)
-        print(f"[Fold {fold}] Balanced Accuracy: {acc:.3f}, AUC: {auc:.3f}")
-        
-        return acc, auc
+        # Test evaluation
+        acc, auc = evaluate_convolutional(model, test_loader, device)
 
+        return acc, auc, val_auc, model
 
-    ############## 5. Cross-Validation Run Control ######################
-    k = model_config['training']['k_folds']
-    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
-    acc_scores, auc_scores = [], []
-    for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), start=1):
-        acc, auc = train_one_fold(train_idx, test_idx, fold=fold)
-        acc_scores.append(acc)
-        auc_scores.append(auc)
-    print(f"Average Test Balanced Accuracy: {np.mean(acc_scores):.3f} ± {np.std(acc_scores):.3f}")
-    print(f"Average Test AUC: {np.mean(auc_scores):.3f} ± {np.std(auc_scores):.3f}")
+    ################### 5. Cross-Validation Run Control ########################
+    best_fold_one_params = cross_validation_control(X, y, subj_label, train_config, train_one_fold, seed)
     
-    
-    
-    ###############################################################################
-    ####[6. OPTIONAL - Retrain model on entire dataset and save for evaluation]####
+    ########################## 6. Optional Retrain on Full Dataset #########################
+    def full_retrain(dataset, best_params):
+        full_loader = DataLoader(dataset, batch_size=best_params['batch_size'], shuffle=True)
 
-    if model_config['training'].get('retrain_full_dataset', False):   # False if key is missing
-        print("Retraining on the full dataset to produce final model...")
-        
-        # Full dataset loader
-        full_loader = DataLoader(dataset, batch_size=model_config['training']['batch_size'], shuffle=True)
-
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # Load a fresh model
         final_model = timm.create_model(model_config['name'], pretrained=True)
         in_features = final_model.classifier.in_features
         final_model.classifier = nn.Linear(in_features, 1)
-        
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         final_model.to(device)
-
-        # Loss function (class imbalance)
-        num_task = (y == 1).sum()
-        num_rest = (y == 0).sum()
-        pos_weight = torch.tensor([num_rest / num_task], dtype=torch.float32).to(device)
+        
+        optimizer = torch.optim.Adam(final_model.parameters(), lr=best_params['lr'])
+        pos_weight = make_class_weight(y, device)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-        # Optimizer
-        if model_config['training']['optimizer'] == 'adam':
-            optimizer = optim.Adam(final_model.parameters(), lr=model_config['training']['lr'])
-        elif model_config['training']['optimizer'] == 'sgd':
-            optimizer = optim.SGD(final_model.parameters(), lr=model_config['training']['lr'], momentum=0.9)
-
         # Training loop
-        for epoch in range(model_config['training']['epochs']):
+        for epoch in range(best_params['epochs']):
             final_model.train()
             total_loss = 0
             for batch_x, batch_y in full_loader:
@@ -264,7 +201,12 @@ def run(config, dataset_name: list):
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-            print(f"[Full Dataset] Epoch {epoch+1} Train Loss: {total_loss/len(full_loader):.3f}")
+            print(f"[Full Dataset] Epoch {epoch+1} Train Loss: {total_loss/len(full_loader):.4f}")
+        return final_model
+    
+    if train_config.get('retrain_full_dataset', False):
+        print("Retraining on full dataset...")
+        final_model = full_retrain(dataset, best_fold_one_params)
 
         # Save final model
         final_model_path = os.path.join(model_config['output_dir'], f"model-{dataset_name}.pth")
