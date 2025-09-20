@@ -28,12 +28,15 @@ def run(config, dataset_name: list):
     
     seed = train_config.get("seed", 42)
     set_seed(seed)
+    learning_plot = train_config["learning_plot"]
+
 
     ########################## 1. Load dataset #################################
     # Loading dataset for 1 task paradigm assessed by 1 method for all subjects (1 run)
     dataset_name = dataset_name[0]  # get the string out
     X, y, subj_label, method = load_dataset(dataset_name, config)
     ROI = get_n_ROI(1, -1, -2 * X.shape[1])  # solves quadratic equation for number of ROIs
+
 
     #################### 2. CNN Model Transformations ##########################
 
@@ -73,6 +76,7 @@ def run(config, dataset_name: list):
 
         return tensor_img
 
+
     #################### 3. Dataset Class ################################
     # Wrap my data into a PyTorch Dataset class to make compatible with DataLoader
     # to train the data batch by batch for each epoch
@@ -103,28 +107,105 @@ def run(config, dataset_name: list):
 
     dataset = dFCDataset(X, y)  # full transformed dataset to be split in CV
     
-    ######################## 4. Training with CV ##############################
-    def train_one_fold(train_idx, val_idx, test_idx, fold, params):
+    
+    ######################## 4. Training and Testing with CV ##############################
+    def train_one_fold(train_idx, val_idx, fold, params):
         '''
-        Train the model for one outer fold of cross-validation.
+        Train the model for one inner fold of cross-validation. (Hyperparameter tuning)
         Parameters:
             train_idx: indices for training set
             val_idx: indices for validation set
-            test_idx: indices for test set
-            fold: current fold number
             params: dictionary of one combination of training parameters
         '''
         # Build dataloaders
         dataloaders = build_dataloaders(
             dataset,
             train_idx,
-            val_idx,
+            test_idx=val_idx,
+            gcn_mode=False,  # CNN mode
+            batch_size=params['batch_size']
+        )
+        train_loader = dataloaders["train"]
+        val_loader = dataloaders["test"]
+
+        ####### Setup device, pre-trained model, and optimizer #######
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # To check if GPU was used (connection to remote server was established):
+        # print("Using device:", torch.cuda.get_device_name(0))
+        # print("Memory allocated:", torch.cuda.memory_allocated())
+        
+        model = timm.create_model(model_config['name'], pretrained=True)
+        # Replace model's classifier with a new fully connected Linear layer to 
+        # directly output a single value
+        # Model backbone outputs shape: (batch_size, num_neurons) then
+        # nn.Linear maps this to shape: (batch_size, 1) to compare against labels
+        in_features = model.classifier.in_features
+        model.classifier = nn.Linear(in_features, 1)  # binary classification
+        model.to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+        # Loss function adjusted for class imbalance
+        pos_weight = make_class_weight(y[train_idx], device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        
+        # Training loop
+        inner_train_losses, val_losses = [], [] # loss trackers for figures
+            
+        for epoch in range(params['epochs']):
+            model.train()   # set model to training mode (dropout, batchnorm, etc. 
+                            # behave differently in train vs eval)
+            total_loss = 0  # accumulate loss over batches
+            for batch_x, batch_y in train_loader: # batch_x.shape = (batch_size, 3, 224, 224)
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device).float().unsqueeze(1)
+                optimizer.zero_grad()   # zero the gradients accumulated before
+                output = model(batch_x) # forward pass through the model to get logit predictions
+                loss = criterion(output, batch_y)
+                loss.backward() # backpropagate the loss to compute gradients
+                optimizer.step()    # update model parameters using the gradients
+                total_loss += loss.item()
+            
+            # store average training loss per sample for this epoch
+            inner_train_losses.append(total_loss / len(train_loader))
+
+            if fold == 1 and learning_plot:
+                # Also log validation losses
+                model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                    for batch_x, batch_y in val_loader:
+                        batch_x, batch_y = batch_x.to(device), batch_y.to(device).float().unsqueeze(1)
+                        output = model(batch_x)
+                        loss = criterion(output, batch_y)
+                        val_loss += loss.item()
+                val_losses.append(val_loss / len(val_loader))
+
+        # Validation evaluation
+        _, val_auc = evaluate_convolutional(model, val_loader, device)
+        
+        if fold == 1 and learning_plot:
+            return val_auc, inner_train_losses, val_losses
+
+        return val_auc
+    
+    
+    def test_one_fold(train_idx, test_idx, fold, params):
+        '''
+        Test the model for one fold of cross-validation (includes training on train+val set
+        with best hyperparameters found in inner loop for that fold).
+        Parameters:
+            train_idx: indices for TRAIN+VAL set
+            test_idx: indices for test set
+            fold: current outer fold number
+            params: dictionary of one combination of training parameters
+        '''
+        # Build dataloaders
+        dataloaders = build_dataloaders(
+            dataset,
+            train_idx,
             test_idx,
             gcn_mode=False,  # CNN mode
             batch_size=params['batch_size']
         )
         train_loader = dataloaders["train"]
-        val_loader = dataloaders["val"]
         test_loader = dataloaders["test"]
 
         ####### Setup device, pre-trained model, and optimizer #######
@@ -147,6 +228,9 @@ def run(config, dataset_name: list):
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         
         # Training loop
+        if fold == 1 and learning_plot:
+            outer_train_losses, test_losses = [], [] # loss trackers for figures
+            
         for epoch in range(params['epochs']):
             model.train()   # set model to training mode (dropout, batchnorm, etc. 
                             # behave differently in train vs eval)
@@ -160,19 +244,36 @@ def run(config, dataset_name: list):
                 optimizer.step()    # update model parameters using the gradients
                 total_loss += loss.item()
 
-            if fold == 1:  # only for first fold to check trend
-                print(f"[Fold {fold}] Epoch {epoch+1} Train Loss: {total_loss/len(train_loader):.4f}")
+            epoch_loss = total_loss / len(train_loader)
+            if fold == 1:  # only for first fold to check trend with best params
+                print(f"[Fold {fold}] Epoch {epoch+1} Train Loss: {epoch_loss:.4f}")
 
-        # Validation evaluation
-        _, val_auc = evaluate_convolutional(model, val_loader, device)
+            if fold == 1 and learning_plot:
+                outer_train_losses.append(epoch_loss)
+                # Also log test losses
+                model.eval()
+                test_loss = 0
+                with torch.no_grad():
+                    for batch_x, batch_y in test_loader:
+                        batch_x, batch_y = batch_x.to(device), batch_y.to(device).float().unsqueeze(1)
+                        output = model(batch_x)
+                        loss = criterion(output, batch_y)
+                        test_loss += loss.item()
+                test_losses.append(test_loss / len(test_loader))
 
         # Test evaluation
         acc, auc = evaluate_convolutional(model, test_loader, device)
 
-        return acc, auc, val_auc, model
+        if fold == 1 and learning_plot:
+            return acc, auc, outer_train_losses, test_losses
+
+        return acc, auc
+
 
     ################### 5. Cross-Validation Run Control ########################
-    best_fold_one_params = cross_validation_control(X, y, subj_label, train_config, train_one_fold, seed)
+    best_fold_one_params = cross_validation_control(X, y, subj_label, train_config, train_one_fold, 
+                                                    test_one_fold, model_name="CNN", seed=seed)
+    
     
     ########################## 6. Optional Retrain on Full Dataset #########################
     def full_retrain(dataset, best_params):

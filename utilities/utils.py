@@ -81,3 +81,34 @@ def harmonize_TR(datasets: list):
             "Mismatch in TR labels after harmonization. Bad!!"
 
     return harmonized
+
+
+def make_long_df(data):  # for figures.ipynb
+    """
+    Convert dictionary with array-like scores into long-form DataFrame for 
+    making performance plots. Each outer fold score becomes a separate row.
+
+    Parameters:
+    data: dict
+        Dictionary with keys "Task_Paradigm", "Assessment_Method", "Score.
+        - "Score": list of np.arrays, each of shape (num_outer_folds,). 
+            Balanced accuracy or AUC
+
+    Returns:
+    pd.DataFrame
+        Long-form dataframe with columns: Dataset, Assessment_Method, metric
+    """
+    rows = []
+    for paradigm, method, model, scores in zip(
+        data["Task_Paradigm"], data["Assessment_Method"], data["Model"], data["Score"]
+    ):
+        # scores is a numpy array of shape (num_outer_folds,)
+        for s in np.atleast_1d(scores):  # handles both scalars & arrays; loop over folds
+            rows.append({
+                "Task_Paradigm": paradigm,
+                "Assessment_Method": method,
+                "Model": model,
+                "Score": float(s)
+            })
+    
+    return pd.DataFrame(rows)

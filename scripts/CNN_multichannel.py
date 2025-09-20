@@ -10,8 +10,9 @@ import torch.optim as optim
 
 import os
 from utilities.utils import get_n_ROI, vec_to_symmetric_matrix, harmonize_TR
-from utilities.train_utils import set_seed, cross_validation_control, save_model
-from CNN import train_one_fold, full_retrain
+from utilities.train_utils import set_seed, \
+    build_dataloaders, make_class_weight, evaluate_convolutional, \
+    cross_validation_control, save_model
 
 
 #### This script builds a pretrained CNN using 3 datasets (dFC assessment methods) 
@@ -36,6 +37,7 @@ def run(config, dataset_names: list):
         raise ValueError("This script is designed to work with exactly 3 datasets", 
                          "representing 1 task paradigm assessed by 3 methods")
 
+
     ########################## 1. Load datasets #################################
     datasets_list = []
     for dataset_name in dataset_names:
@@ -47,6 +49,7 @@ def run(config, dataset_names: list):
 
     # assume all datasets had same number of ROIs, so we can use the first one
     ROI = get_n_ROI(1, -1, -2 * datasets_list[0]["X"].shape[1])
+
 
     ######################### 2. Transformations ################################
 
@@ -126,13 +129,164 @@ def run(config, dataset_names: list):
     subj_label = dataset.subj_label
     print("Harmonized X.shape:", X.shape)
     
+    
     ############### 4. Training with CV ######################
-    # Same as CNN.py
+    def train_one_fold(train_idx, val_idx, params):
+        '''
+        Train the model for one inner fold of cross-validation. (Hyperparameter tuning)
+        Parameters:
+            train_idx: indices for training set
+            val_idx: indices for validation set
+            params: dictionary of one combination of training parameters
+        '''
+        # Build dataloaders
+        dataloaders = build_dataloaders(
+            dataset,
+            train_idx,
+            test_idx=val_idx,
+            gcn_mode=False,  # CNN mode
+            batch_size=params['batch_size']
+        )
+        train_loader = dataloaders["train"]
+        val_loader = dataloaders["test"]
+
+        ####### Setup device, pre-trained model, and optimizer #######
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # To check if GPU was used (connection to remote server was established):
+        # print("Using device:", torch.cuda.get_device_name(0))
+        # print("Memory allocated:", torch.cuda.memory_allocated())
+        
+        model = timm.create_model(model_config['name'], pretrained=True)
+        # Replace model's classifier with a new fully connected Linear layer to 
+        # directly output a single value
+        # Model backbone outputs shape: (batch_size, num_neurons) then
+        # nn.Linear maps this to shape: (batch_size, 1) to compare against labels
+        in_features = model.classifier.in_features
+        model.classifier = nn.Linear(in_features, 1)  # binary classification
+        model.to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+        # Loss function adjusted for class imbalance
+        pos_weight = make_class_weight(y[train_idx], device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        
+        # Training loop
+        for epoch in range(params['epochs']):
+            model.train()   # set model to training mode (dropout, batchnorm, etc. 
+                            # behave differently in train vs eval)
+            total_loss = 0  # accumulate loss over batches
+            for batch_x, batch_y in train_loader: # batch_x.shape = (batch_size, 3, 224, 224)
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device).float().unsqueeze(1)
+                optimizer.zero_grad()   # zero the gradients accumulated before
+                output = model(batch_x) # forward pass through the model to get logit predictions
+                loss = criterion(output, batch_y)
+                loss.backward() # backpropagate the loss to compute gradients
+                optimizer.step()    # update model parameters using the gradients
+                total_loss += loss.item()
+
+        # Validation evaluation
+        _, val_auc = evaluate_convolutional(model, val_loader, device)
+
+        return val_auc
+    
+    
+    def test_one_fold(train_idx, test_idx, fold, params):
+        '''
+        Test the model for one fold of cross-validation (includes training on train+val set
+        with best hyperparameters found in inner loop for that fold).
+        Parameters:
+            train_idx: indices for TRAIN+VAL set
+            test_idx: indices for test set
+            fold: current outer fold number
+            params: dictionary of one combination of training parameters
+        '''
+        # Build dataloaders
+        dataloaders = build_dataloaders(
+            dataset,
+            train_idx,
+            test_idx,
+            gcn_mode=False,  # CNN mode
+            batch_size=params['batch_size']
+        )
+        train_loader = dataloaders["train"]
+        test_loader = dataloaders["test"]
+
+        ####### Setup device, pre-trained model, and optimizer #######
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # To check if GPU was used (connection to remote server was established):
+        # print("Using device:", torch.cuda.get_device_name(0))
+        # print("Memory allocated:", torch.cuda.memory_allocated())
+        
+        model = timm.create_model(model_config['name'], pretrained=True)
+        # Replace model's classifier with a new fully connected Linear layer to 
+        # directly output a single value
+        # Model backbone outputs shape: (batch_size, num_neurons) then
+        # nn.Linear maps this to shape: (batch_size, 1) to compare against labels
+        in_features = model.classifier.in_features
+        model.classifier = nn.Linear(in_features, 1)  # binary classification
+        model.to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+        # Loss function adjusted for class imbalance
+        pos_weight = make_class_weight(y[train_idx], device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        
+        # Training loop
+        for epoch in range(params['epochs']):
+            model.train()   # set model to training mode (dropout, batchnorm, etc. 
+                            # behave differently in train vs eval)
+            total_loss = 0  # accumulate loss over batches
+            for batch_x, batch_y in train_loader: # batch_x.shape = (batch_size, 3, 224, 224)
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device).float().unsqueeze(1)
+                optimizer.zero_grad()   # zero the gradients accumulated before
+                output = model(batch_x) # forward pass through the model to get logit predictions
+                loss = criterion(output, batch_y)
+                loss.backward() # backpropagate the loss to compute gradients
+                optimizer.step()    # update model parameters using the gradients
+                total_loss += loss.item()
+
+            if fold == 1:  # only for first fold to check trend with best params
+                print(f"[Fold {fold}] Epoch {epoch+1} Train Loss: {total_loss/len(train_loader):.4f}")
+
+        # Test evaluation
+        acc, auc = evaluate_convolutional(model, test_loader, device)
+
+        return acc, auc
+
 
     ############## 5. Cross-Validation Run Control ######################
-    best_fold_one_params = cross_validation_control(X, y, subj_label, train_config, train_one_fold, seed)
+    best_fold_one_params = cross_validation_control(X, y, subj_label, train_config, 
+                                        train_one_fold, test_one_fold, model_name="CNN_multichannel", seed=seed)
     
-    ########################## 6. Optional Retrain on Full Dataset #########################
+    
+    ################### 6. Optional Retrain on Full Dataset ###################
+    def full_retrain(dataset, best_params):
+        full_loader = DataLoader(dataset, batch_size=best_params['batch_size'], shuffle=True)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Load a fresh model
+        final_model = timm.create_model(model_config['name'], pretrained=True)
+        in_features = final_model.classifier.in_features
+        final_model.classifier = nn.Linear(in_features, 1)
+        final_model.to(device)
+        
+        optimizer = torch.optim.Adam(final_model.parameters(), lr=best_params['lr'])
+        pos_weight = make_class_weight(y, device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        # Training loop
+        for epoch in range(best_params['epochs']):
+            final_model.train()
+            total_loss = 0
+            for batch_x, batch_y in full_loader:
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device).float().unsqueeze(1)
+                optimizer.zero_grad()
+                output = final_model(batch_x)
+                loss = criterion(output, batch_y)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            print(f"[Full Dataset] Epoch {epoch+1} Train Loss: {total_loss/len(full_loader):.4f}")
+        return final_model
+    
     if train_config.get('retrain_full_dataset', False):
         print("Retraining on full dataset...")
         final_model = full_retrain(dataset, best_fold_one_params)
