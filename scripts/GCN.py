@@ -29,8 +29,10 @@ def run(config, dataset_name: list):
     seed = train_config.get("seed", 42)
     set_seed(seed)
     
-    mode = model_config.get("mode", "full") # graph edge connectivity mode
-    print(f"Graph connectivity mode: {mode}")
+    mode = model_config.get("edge_mode", "full") # graph edge connectivity mode
+    k = model_config.get("k", None) # number of neighbors to keep connected to each node
+    threshold = model_config.get("threshold", 0.5) # minimum edge weight to keep
+    print(f"Graph connectivity mode: {mode}, (k={k} neighbours, threshold={threshold} if applicable)")
 
 
     ########################## 1. Load dataset #################################
@@ -67,7 +69,6 @@ def run(config, dataset_name: list):
             edge_list = [(i, j) for i in range(num_nodes) for j in range(num_nodes) if i != j]
 
         elif mode == "knn":
-            k = model_config.get("k", None) # number of neighbors to keep connected to each node
             if k is None:
                 raise ValueError("A value for k must be specified for knn mode. See config.yaml")
             for i in range(num_nodes):
@@ -77,7 +78,6 @@ def run(config, dataset_name: list):
                 edge_list.extend([(i, j) for j in neighbors])
 
         elif mode == "threshold":
-            threshold = model_config.get("threshold", 0.5) # minimum edge weight to keep
             edge_list = [(i, j) for i in range(num_nodes) for j in range(num_nodes) 
                         if i != j and dfc_matrix[i, j] >= threshold]
 
@@ -246,7 +246,8 @@ def run(config, dataset_name: list):
     
 
     ########################## 5. Cross Validation ##############################
-    best_fold_one_params = cross_validation_control(X, y, subj_label, train_config, train_one_fold, test_one_fold, seed)
+    best_fold_one_params = cross_validation_control(X, y, subj_label, train_config, 
+                                            train_one_fold, test_one_fold, model_name="GCN", seed=seed)
     
     
     ########################## 6. Optional Retrain on Full Dataset #########################

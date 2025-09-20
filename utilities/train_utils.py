@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+from datetime import datetime
 
 
 def set_seed(seed):
@@ -125,11 +126,15 @@ def evaluate_convolutional(model, dataloader, device):  # CNN evaluation
     return acc, auc
 
 
-def cross_validation_control(X, y, subj_label, train_config, train_one_fold, test_one_fold, seed=42):
+def cross_validation_control(X, y, subj_label, train_config, train_one_fold, 
+                             test_one_fold, model_name="CNN", seed=42):
     param_grid = expand_param_grid(train_config)
     best_fold_one_params = None # to store best params from first outer fold
+    learning_plot = train_config.get('learning_plot', False)
     acc_scores, auc_scores = [], []
-    fold = 1    # number of outer folds
+    total_inner_train_losses, total_val_losses = [], [] # for fold 1
+    fold = 1    # iterate over number of outer folds for logging purposes
+    date_str = datetime.now().strftime("%Y%m%d")    # for saving files
     
     outer_kf = StratifiedGroupKFold(
         n_splits=train_config['outer_folds'], shuffle=True, random_state=seed
@@ -151,7 +156,13 @@ def cross_validation_control(X, y, subj_label, train_config, train_one_fold, tes
             for train_idx, val_idx in inner_kf.split(X_trainval, y_trainval, groups_trainval):
                 train_idx = trainval_idx[train_idx]
                 val_idx = trainval_idx[val_idx]
-                val_auc = train_one_fold(train_idx, val_idx, params)
+                if fold == 1 and learning_plot:
+                    val_auc, inner_train_losses, val_losses = train_one_fold(train_idx, val_idx, fold, params)
+                    total_inner_train_losses.append(inner_train_losses)
+                    total_val_losses.append(val_losses)
+                else:
+                    val_auc = train_one_fold(train_idx, val_idx, fold, params)
+                
                 param_val_aucs.append(val_auc)
             # since dictionary keys must be immutable, convert params dict to sorted tuple of tuples
             val_aucs[tuple(sorted(params.items()))] = np.mean(param_val_aucs)
@@ -160,15 +171,40 @@ def cross_validation_control(X, y, subj_label, train_config, train_one_fold, tes
         best_params = dict(max(val_aucs, key=val_aucs.get)) # convert from tuple back to dict
         if fold == 1:   # for final retraining on full dataset
             best_fold_one_params = best_params
-        print(f"[Fold {fold}] Best params: {best_params}, Best Val AUC: {best_val_auc:.3f}")
 
         # Retrain on train+val (80% of subjects) with best params for that outer fold, evaluate on test
-        acc, auc = test_one_fold(trainval_idx, test_idx, fold, params=best_params)
-        print(f"[Fold {fold}] Test Balanced Accuracy: {acc:.3f}, Test AUC: {auc:.3f}\n")
+        if fold == 1 and learning_plot: # save losses for fold 1
+            acc, auc, outer_train_losses, test_losses = test_one_fold(
+                trainval_idx, test_idx, fold, params=best_params
+            )
+            save_dir = os.path.join("saved_performances", model_name, "losses")
+            os.makedirs(save_dir, exist_ok=True)
+
+            np.save(os.path.join(save_dir, f"inner_train_losses_{date_str}.npy"),
+                    np.round(np.array(total_inner_train_losses, dtype=object), decimals=5))
+            np.save(os.path.join(save_dir, f"val_losses_{date_str}.npy"),
+                    np.round(np.array(total_val_losses, dtype=object), decimals=5))
+            np.save(os.path.join(save_dir, f"outer_train_losses_{date_str}.npy"),
+                    np.round(np.array(outer_train_losses, dtype=object), decimals=5))
+            np.save(os.path.join(save_dir, f"test_losses_{date_str}.npy"),
+                    np.round(np.array(test_losses, dtype=object), decimals=5))
+
+        else:
+            acc, auc = test_one_fold(trainval_idx, test_idx, fold, params=best_params)
+
         acc_scores.append(acc)
         auc_scores.append(auc)
-        
+        print(f"[Fold {fold}] Best params: {best_params}, Best Val AUC: {best_val_auc:.3f}")
+        print(f"[Fold {fold}] Test Balanced Accuracy: {acc:.3f}, Test AUC: {auc:.3f}\n")
+    
         fold += 1
+    
+    # Save metrics per outer fold and print overall metrics
+    save_dir = os.path.join("saved_performances", model_name, "metrics")
+    os.makedirs(save_dir, exist_ok=True)
+    np.save(os.path.join(save_dir, f"acc_scores_{date_str}.npy"), np.round(np.array(acc_scores), decimals=4))
+    np.save(os.path.join(save_dir, f"auc_scores_{date_str}.npy"), np.round(np.array(auc_scores), decimals=4))
+    # General reporting
     print(f"Overall Test Balanced Accuracy: {np.mean(acc_scores):.3f} ± {np.std(acc_scores):.3f}")
     print(f"Overall Test AUC: {np.mean(auc_scores):.3f} ± {np.std(auc_scores):.3f}\n\n")
     
