@@ -34,7 +34,7 @@ def main(script, dataset_name, description="None"):
             print(f"Error: Dataset '{ds}' not found in config.yaml")
             exit(1)
     
-    print(f"Description of changes: {description}")
+    print(f"Description: {description}")
     print(f"Running script '{script}' on dataset(s) '{dataset_name}'")
 
     # Dynamically load and run the desired script
@@ -43,11 +43,14 @@ def main(script, dataset_name, description="None"):
 
 
 if __name__ == "__main__":
-    script = "GCN"  # Change this to run different scripts
-    description = "Running script on multiple datasets at once."
+    script = "CNN"  # Change this to run different scripts
+    run_whole_paradigm = True   # Set to False to submit job for only one dataset (non-CNN_multichannel)
+    description = "Get performances needed for figures for BMO report."
 
     if script == "CNN_multichannel": # Only this script uses multiple datasets at once
-        main(script, ["axcpt_sw", "axcpt_tf", "axcpt_cap"], description)
+        main(script, ["stern_sw", "stern_tf", "stern_cap"], description)
+    elif not run_whole_paradigm:   # Only run on one dataset
+        main(script, ["axcpt_cap"], description)
     else: # Run other scripts on individual datasets; loop for job submission convenience
-        for dataset in [["axcpt_sw"], ["axcpt_tf"], ["axcpt_cap"]]:
+        for dataset in [["stern_sw"], ["stern_tf"], ["stern_cap"]]:
             main(script, dataset, description)

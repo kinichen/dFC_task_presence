@@ -127,7 +127,7 @@ def evaluate_convolutional(model, dataloader, device):  # CNN evaluation
 
 
 def cross_validation_control(X, y, subj_label, train_config, train_one_fold, 
-                             test_one_fold, model_name="CNN", seed=42):
+                             test_one_fold, model_name, dataset_name, seed=42):
     param_grid = expand_param_grid(train_config)
     best_fold_one_params = None # to store best params from first outer fold
     learning_plot = train_config.get('learning_plot', False)
@@ -180,14 +180,16 @@ def cross_validation_control(X, y, subj_label, train_config, train_one_fold,
             save_dir = os.path.join("saved_performances", model_name, "losses")
             os.makedirs(save_dir, exist_ok=True)
 
-            np.save(os.path.join(save_dir, f"inner_train_losses_{date_str}.npy"),
-                    np.round(np.array(total_inner_train_losses, dtype=object), decimals=5))
-            np.save(os.path.join(save_dir, f"val_losses_{date_str}.npy"),
-                    np.round(np.array(total_val_losses, dtype=object), decimals=5))
-            np.save(os.path.join(save_dir, f"outer_train_losses_{date_str}.npy"),
-                    np.round(np.array(outer_train_losses, dtype=object), decimals=5))
-            np.save(os.path.join(save_dir, f"test_losses_{date_str}.npy"),
-                    np.round(np.array(test_losses, dtype=object), decimals=5))
+            np.save(os.path.join(save_dir, f"inner_train_losses_{dataset_name}_{date_str}.npy"),
+                    np.round(np.array(total_inner_train_losses, dtype=float), decimals=5))  
+                # Shape: (num_hyperparams_combos*num_inner_folds, num_epochs)
+            np.save(os.path.join(save_dir, f"val_losses_{dataset_name}_{date_str}.npy"),
+                    np.round(np.array(total_val_losses, dtype=float), decimals=5))
+            np.save(os.path.join(save_dir, f"outer_train_losses_{dataset_name}_{date_str}.npy"),
+                    np.round(np.array(outer_train_losses, dtype=float), decimals=5))
+                # Shape: (num_epochs,)
+            np.save(os.path.join(save_dir, f"test_losses_{dataset_name}_{date_str}.npy"),
+                    np.round(np.array(test_losses, dtype=float), decimals=5))
 
         else:
             acc, auc = test_one_fold(trainval_idx, test_idx, fold, params=best_params)
@@ -202,8 +204,10 @@ def cross_validation_control(X, y, subj_label, train_config, train_one_fold,
     # Save metrics per outer fold and print overall metrics
     save_dir = os.path.join("saved_performances", model_name, "metrics")
     os.makedirs(save_dir, exist_ok=True)
-    np.save(os.path.join(save_dir, f"acc_scores_{date_str}.npy"), np.round(np.array(acc_scores), decimals=4))
-    np.save(os.path.join(save_dir, f"auc_scores_{date_str}.npy"), np.round(np.array(auc_scores), decimals=4))
+    np.save(os.path.join(save_dir, f"acc_{dataset_name}_{date_str}.npy"), 
+            np.round(np.array(acc_scores, dtype=float), decimals=4))
+    np.save(os.path.join(save_dir, f"auc_{dataset_name}_{date_str}.npy"), 
+            np.round(np.array(auc_scores, dtype=float), decimals=4))
     # General reporting
     print(f"Overall Test Balanced Accuracy: {np.mean(acc_scores):.3f} ± {np.std(acc_scores):.3f}")
     print(f"Overall Test AUC: {np.mean(auc_scores):.3f} ± {np.std(auc_scores):.3f}\n\n")

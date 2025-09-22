@@ -271,8 +271,16 @@ def run(config, dataset_name: list):
 
 
     ################### 5. Cross-Validation Run Control ########################
-    best_fold_one_params = cross_validation_control(X, y, subj_label, train_config, train_one_fold, 
-                                                    test_one_fold, model_name="CNN", seed=seed)
+    best_fold_one_params = cross_validation_control(
+        X, 
+        y, 
+        subj_label, 
+        train_config, 
+        train_one_fold,
+        test_one_fold, 
+        model_name="CNN", 
+        dataset_name=dataset_name, 
+        seed=seed)
     
     
     ########################## 6. Optional Retrain on Full Dataset #########################
