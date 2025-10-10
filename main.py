@@ -2,7 +2,7 @@ import yaml
 import importlib
 
 
-def main(script, dataset_name, description="None"):
+def main(script, dataset_name, date_str, description="None"):
     '''Main function to run specified script on given dataset(s) with 
     an optional description.
     Parameters:
@@ -34,20 +34,32 @@ def main(script, dataset_name, description="None"):
             print(f"Error: Dataset '{ds}' not found in config.yaml")
             exit(1)
     
-    print(f"Description of changes: {description}")
+    print(f"Description: {description}, Date/Version: {date_str}")
     print(f"Running script '{script}' on dataset(s) '{dataset_name}'")
 
     # Dynamically load and run the desired script
     script_module = importlib.import_module(f"scripts.{script}")
-    script_module.run(config, dataset_name)
+    script_module.run(config, dataset_name, date_str)
 
 
 if __name__ == "__main__":
-    script = "GCN"  # Change this to run different scripts
-    description = "Running script on multiple datasets at once."
+    ######################### CHANGE THIS FOR RUNS ############################
+    script = "CNN"  # CNN or GCN (if want multichannel, set script = "CNN"; dataset_name = list of 3 datasets)
+    dataset_name = ["axcpt_tf"]  # Multichannel e.g. ["stern_sw", "stern_tf", "stern_cap"]; Single e.g. ["axcpt_cap"]
+    run_whole_paradigm = False   # Set to False to submit job for only one dataset (non-CNN_multichannel)
+    description = "Resnet18, AdamW, No freezing, Dropout=0.3, 3 outer CV folds, batchnorm before classifier"
+    
+    # *** Version of the performance output. Must change to avoid overwriting previous results ***
+    date_str = "20251010"
+    ############################################################################
 
-    if script == "CNN_multichannel": # Only this script uses multiple datasets at once
-        main(script, ["axcpt_sw", "axcpt_tf", "axcpt_cap"], description)
-    else: # Run other scripts on individual datasets; loop for job submission convenience
-        for dataset in [["axcpt_sw"], ["axcpt_tf"], ["axcpt_cap"]]:
-            main(script, dataset, description)
+    if len(dataset_name) == 3:
+        assert script == "CNN", "If using 3 datasets, script must be 'CNN' for multichannel"
+        run_whole_paradigm = False # if multichannel, methods for each paradigm are collapsed into one run, so no need to loop
+        
+    if not run_whole_paradigm:   # Only run on one dataset
+        main(script, dataset_name, date_str, description)
+        
+    else: # For GCN and single-channel CNN, loop through all method datasets of one paradigm for job submission convenience
+        for dataset in [["stroop_sw"], ["stroop_tf"], ["stroop_cap"]]:
+            main(script, dataset, date_str, description)

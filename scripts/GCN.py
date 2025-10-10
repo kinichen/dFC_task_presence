@@ -15,19 +15,21 @@ from utilities.train_utils import set_seed, load_dataset, \
     cross_validation_control, save_model
 
 
-def run(config, dataset_name: list):
+def run(config, dataset_name: list, date_str: str):
     """
     Main function to run the script with the given configuration.
     
     Parameters:
         config (dict): configuration parameters loaded from config.yaml
         dataset_name (list): single element is the name of the dataset to be processed
+        date_str (str): date string for logging and saving purposes
     """
     model_config = config["models"]["GCN"]
     train_config = model_config["training"]
     
     seed = train_config.get("seed", 42)
     set_seed(seed)
+    learning_plot = train_config["learning_plot"]
     
     mode = model_config.get("edge_mode", "full") # graph edge connectivity mode
     k = model_config.get("k", None) # number of neighbors to keep connected to each node
@@ -139,7 +141,7 @@ def run(config, dataset_name: list):
 
 
     ################### 4. Training and Testing with CV ###########################
-    def train_one_fold(train_idx, val_idx, params):
+    def train_one_fold(train_idx, val_idx, fold, params):
         '''
         Train the model for one inner fold of cross-validation. (Hyperparameter tuning)
         Parameters:
@@ -162,11 +164,14 @@ def run(config, dataset_name: list):
         # Setup device, model, and optimizer
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = GCN(hidden_dim=params['hidden_dim']).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+        optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'], weight_decay=params['weight_decay'])
 
         # Loss function adjusted for class imbalance
         pos_weight = make_class_weight(y[train_idx], device)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        
+        if fold == 1 and learning_plot:
+            inner_train_losses, val_losses = [], []
 
         # Training loop
         for epoch in range(params['epochs']):
@@ -179,14 +184,29 @@ def run(config, dataset_name: list):
                 
                 optimizer.zero_grad()
                 out = model(data.x, data.edge_index, data.edge_attr, data.batch)
-                loss = criterion(out, data.y.unsqueeze(1))
+                loss = criterion(out, data.y.unsqueeze(1).float())
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
 
-        # Validation evaluation
+            
+            if fold == 1 and learning_plot:
+                inner_train_losses.append(total_loss / len(train_loader))
+                # Validation losses
+                model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                    for data in val_loader:
+                        data = data.to(device)
+                        out = model(data.x, data.edge_index, data.edge_attr, data.batch)
+                        loss = criterion(out, data.y.unsqueeze(1).float())
+                        val_loss += loss.item()
+                val_losses.append(val_loss / len(val_loader))
+
         _, val_auc = evaluate_graph(model, val_loader, device)
 
+        if fold == 1 and learning_plot:
+            return val_auc, inner_train_losses, val_losses
         return val_auc
 
 
@@ -214,11 +234,14 @@ def run(config, dataset_name: list):
         # Setup device, model, and optimizer
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = GCN(hidden_dim=params['hidden_dim']).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+        optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'], weight_decay=params['weight_decay'])
 
         # Loss function adjusted for class imbalance
         pos_weight = make_class_weight(y[train_idx], device)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        
+        if fold == 1 and learning_plot:
+            outer_train_losses, test_losses = [], []
 
         # Training loop
         for epoch in range(params['epochs']):
@@ -231,37 +254,59 @@ def run(config, dataset_name: list):
                 
                 optimizer.zero_grad()
                 out = model(data.x, data.edge_index, data.edge_attr, data.batch)
-                loss = criterion(out, data.y.unsqueeze(1))
+                loss = criterion(out, data.y.unsqueeze(1).float())
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
+                
+            epoch_loss = total_loss / len(train_loader)
+            if fold == 1:
+                print(f"[Fold {fold}] Epoch {epoch+1} Train Loss: {epoch_loss:.4f}")
+            if fold == 1 and learning_plot:
+                outer_train_losses.append(epoch_loss)
+                # Test losses
+                model.eval()
+                test_loss = 0
+                with torch.no_grad():
+                    for data in test_loader:
+                        data = data.to(device)
+                        out = model(data.x, data.edge_index, data.edge_attr, data.batch)
+                        loss = criterion(out, data.y.unsqueeze(1).float())
+                        test_loss += loss.item()
+                test_losses.append(test_loss / len(test_loader))
 
-            if fold == 1:  # only print for first fold
-                print(f"[Fold {fold}] Epoch {epoch+1}, Train Loss: {total_loss/len(train_loader):.4f}")
-
-        # Test evaluation
         acc, auc = evaluate_graph(model, test_loader, device)
 
+        if fold == 1 and learning_plot:
+            return acc, auc, outer_train_losses, test_losses
         return acc, auc
     
 
     ########################## 5. Cross Validation ##############################
-    best_fold_one_params = cross_validation_control(X, y, subj_label, train_config, 
-                                            train_one_fold, test_one_fold, model_name="GCN", seed=seed)
+    best_fold_one_params = cross_validation_control(
+        X, 
+        y, 
+        subj_label, 
+        train_config,
+        train_one_fold, 
+        test_one_fold, 
+        model_name="GCN", 
+        dataset_name=dataset_name,
+        date_str=date_str,
+        seed=seed)
     
     
     ########################## 6. Optional Retrain on Full Dataset #########################
-    if train_config.get('retrain_full_dataset', False):
-        print("Retraining on full dataset...")
-        full_loader = DataLoader(dataset, batch_size=best_fold_one_params['batch_size'], shuffle=True)
+    def full_retrain(dataset, best_params):
+        full_loader = DataLoader(dataset, batch_size=best_params['batch_size'], shuffle=True)
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        final_model = GCN(hidden_dim=best_fold_one_params['hidden_dim']).to(device)
-        optimizer = torch.optim.Adam(final_model.parameters(), lr=best_fold_one_params['lr'])
+        final_model = GCN(hidden_dim=best_params['hidden_dim']).to(device)
+        optimizer = torch.optim.Adam(final_model.parameters(), lr=best_params['lr'], weight_decay=best_params['weight_decay'])
         pos_weight = make_class_weight(y, device)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-        for epoch in range(best_fold_one_params['epochs']):
+        for epoch in range(best_params['epochs']):
             final_model.train()
             total_loss = 0
             for data in full_loader:
@@ -275,6 +320,12 @@ def run(config, dataset_name: list):
                 optimizer.step()
                 total_loss += loss.item()
             print(f"[Full Dataset] Epoch {epoch+1} Train Loss: {total_loss/len(full_loader):.4f}")
+        return final_model
 
+
+    if train_config.get('retrain_full_dataset', False):
+        print("Retraining on full dataset...")
+        final_model = full_retrain(dataset, best_fold_one_params)
+    
         final_model_path = os.path.join(model_config['output_dir'], f"model-{dataset_name}.pth")
         save_model(final_model, final_model_path)

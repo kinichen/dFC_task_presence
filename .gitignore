@@ -4,6 +4,7 @@ config.yaml
 Datasets/
 slurm_out/
 saved_models/
+saved_performances/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

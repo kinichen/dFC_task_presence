@@ -19,19 +19,21 @@ from utilities.train_utils import set_seed, \
 #### as the 3 RBG image channels, testing whether differerently processed information
 #### improves classification
 
-def run(config, dataset_names: list):
+def run(config, dataset_names: list, date_str: str):
     """
     Main function to run the script with the given configuration.
     
     Parameters:
         config: dict, configuration parameters loaded from config.yaml
         dataset_names: list of str, names of the 3 datasets to be processed
+        date_str: str, date string for output file version logging
     """
     model_config = config["models"]["CNN"]
     train_config = model_config["training"]
     
     seed = train_config.get("seed", 42)
     set_seed(seed)
+    learning_plot = train_config["learning_plot"]
     
     if len(dataset_names) != 3:
         raise ValueError("This script is designed to work with exactly 3 datasets", 
@@ -131,7 +133,7 @@ def run(config, dataset_names: list):
     
     
     ############### 4. Training with CV ######################
-    def train_one_fold(train_idx, val_idx, params):
+    def train_one_fold(train_idx, val_idx, fold, params):
         '''
         Train the model for one inner fold of cross-validation. (Hyperparameter tuning)
         Parameters:
@@ -170,6 +172,8 @@ def run(config, dataset_names: list):
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         
         # Training loop
+        inner_train_losses, val_losses = [], [] # loss trackers for figures
+            
         for epoch in range(params['epochs']):
             model.train()   # set model to training mode (dropout, batchnorm, etc. 
                             # behave differently in train vs eval)
@@ -182,9 +186,27 @@ def run(config, dataset_names: list):
                 loss.backward() # backpropagate the loss to compute gradients
                 optimizer.step()    # update model parameters using the gradients
                 total_loss += loss.item()
+            
+            # store average training loss per sample for this epoch
+            inner_train_losses.append(total_loss / len(train_loader))
+
+            if fold == 1 and learning_plot:
+                # Also log validation losses
+                model.eval()
+                val_loss = 0
+                with torch.no_grad():
+                    for batch_x, batch_y in val_loader:
+                        batch_x, batch_y = batch_x.to(device), batch_y.to(device).float().unsqueeze(1)
+                        output = model(batch_x)
+                        loss = criterion(output, batch_y)
+                        val_loss += loss.item()
+                val_losses.append(val_loss / len(val_loader))
 
         # Validation evaluation
         _, val_auc = evaluate_convolutional(model, val_loader, device)
+        
+        if fold == 1 and learning_plot:
+            return val_auc, inner_train_losses, val_losses
 
         return val_auc
     
@@ -230,6 +252,9 @@ def run(config, dataset_names: list):
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         
         # Training loop
+        if fold == 1 and learning_plot:
+            outer_train_losses, test_losses = [], [] # loss trackers for figures
+            
         for epoch in range(params['epochs']):
             model.train()   # set model to training mode (dropout, batchnorm, etc. 
                             # behave differently in train vs eval)
@@ -243,18 +268,46 @@ def run(config, dataset_names: list):
                 optimizer.step()    # update model parameters using the gradients
                 total_loss += loss.item()
 
+            epoch_loss = total_loss / len(train_loader)
             if fold == 1:  # only for first fold to check trend with best params
-                print(f"[Fold {fold}] Epoch {epoch+1} Train Loss: {total_loss/len(train_loader):.4f}")
+                print(f"[Fold {fold}] Epoch {epoch+1} Train Loss: {epoch_loss:.4f}")
+
+            if fold == 1 and learning_plot:
+                outer_train_losses.append(epoch_loss)
+                # Also log test losses
+                model.eval()
+                test_loss = 0
+                with torch.no_grad():
+                    for batch_x, batch_y in test_loader:
+                        batch_x, batch_y = batch_x.to(device), batch_y.to(device).float().unsqueeze(1)
+                        output = model(batch_x)
+                        loss = criterion(output, batch_y)
+                        test_loss += loss.item()
+                test_losses.append(test_loss / len(test_loader))
 
         # Test evaluation
         acc, auc = evaluate_convolutional(model, test_loader, device)
+
+        if fold == 1 and learning_plot:
+            return acc, auc, outer_train_losses, test_losses
 
         return acc, auc
 
 
     ############## 5. Cross-Validation Run Control ######################
-    best_fold_one_params = cross_validation_control(X, y, subj_label, train_config, 
-                                        train_one_fold, test_one_fold, model_name="CNN_multichannel", seed=seed)
+    paradigm = dataset_names[0].split('_')[0]  # Extract paradigm from dataset name
+        
+    best_fold_one_params = cross_validation_control(
+        X, 
+        y, 
+        subj_label, 
+        train_config,
+        train_one_fold, 
+        test_one_fold, 
+        model_name="CNN", 
+        dataset_name=f"{paradigm}_multichannel-sw-tf-cap",
+        date_str=date_str,
+        seed=seed)
     
     
     ################### 6. Optional Retrain on Full Dataset ###################
