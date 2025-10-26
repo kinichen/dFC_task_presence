@@ -35,29 +35,44 @@ def load_dataset(dataset_name, config):
 
 
 # CNN and GCN Dataloader
-def build_dataloaders(dataset, train_idx, test_idx, gcn_mode, batch_size):
+def build_dataloaders(dataset, train_idx, test_idx, gcn_mode, batch_size, node_level=True):
     """
     Build PyTorch dataloaders for CNN or GCN models.
 
     Parameters:
-        dataset : torch.utils.data.Dataset. Full dataset.
-        train_idx, test_idx : array-like. Indices for splits. test_idx is used for validation as well.
-        batch_size : int
-        num_workers : int
-            Number of subprocesses for data loading.
-        gcn_mode : bool
-            If True, returns raw Subsets (no batching) for GCN, which
-            handles batching itself.
+        dataset: torch.utils.data.Dataset
+            Full dataset.
+        train_idx, test_idx: array-like
+            Indices for splits. test_idx is used for validation as well.
+        gcn_mode: bool
+            If True, build dataloaders suitable for GCNs (PyG Data objects).
+        batch_size: int
+            Batch size for CNNs and graph-level GCNs (small ROI graphs so want batching).
+        node_level: bool, optional
+            If True, use node-level GCN setup (subject graphs with timepoint nodes).
+            If False, use graph-level GCN setup (each dFC matrix = one graph).
 
     Returns:
-        dict of dataloaders (or subsets if gcn_mode=True).
+        dict of dataloaders or subsets.
     """
     train_set = Subset(dataset, train_idx)
     test_set = Subset(dataset, test_idx)
-
+    
     if gcn_mode:
-        return {"train": train_set, "test": test_set}
+        if node_level:
+            # Each Data object sample = one subject (big graph of timepoints)
+            # Usually process one subject at a time (no batching)
+            train_loader = train_set
+            test_loader = test_set
+        else:
+            # Each sample = one dFC matrix (small graph with num_nodes = num_ROIs)
+            # Can batch multiple graphs using PyG DataLoader
+            train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+            test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
 
+        return {"train": train_loader, "test": test_loader}
+
+    # CNN mode
     dataloaders = {
         "train": DataLoader(train_set, batch_size=batch_size, shuffle=True),
         "test": DataLoader(test_set, batch_size=batch_size, shuffle=False)
@@ -82,32 +97,43 @@ def expand_param_grid(train_config):
 
 
 def make_class_weight(y_subset, device):
-    '''Calculate class weights for imbalanced datasets.'''
+    """
+    Calculate class weights for imbalanced datasets.
+    """
     num_pos = (y_subset == 1).sum()
     num_neg = (y_subset == 0).sum()
     pos_weight = torch.tensor([num_neg / num_pos], dtype=torch.float32).to(device)
     return pos_weight   # penalize false negatives more heavily
 
 
-def evaluate_graph(model, dataloader, device):  # GCN evaluation
+def evaluate_gcn(model, dataloader, device, node_level):
+    """
+    Evaluate GCN model for either node-level or graph-level classification.
+    dataloader = val/test dataloader.
+    """
     model.eval()
     all_preds, all_probs, all_labels = [], [], []
     with torch.no_grad():
         for data in dataloader:
             data = data.to(device)
-            out = model(data.x, data.edge_index, data.edge_attr, data.batch)
-            probs = torch.sigmoid(out)
+
+            if node_level:
+                out = model(data.x, data.edge_index, data.edge_attr)  # no batch. Shape: (num_nodes, 1)
+            else:
+                out = model(data.x, data.edge_index, data.edge_attr, data.batch) # Shape: (batch_size = num_graphs, 1)
+            
+            probs = torch.sigmoid(out).view(-1)
             preds = (probs > 0.5).float()
             all_preds.extend(preds.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
             all_labels.extend(data.y.cpu().numpy())
 
-        acc = balanced_accuracy_score(all_labels, all_preds)
-        auc = roc_auc_score(all_labels, all_probs) if len(np.unique(all_labels)) > 1 else 0.5
+    acc = balanced_accuracy_score(all_labels, all_preds)
+    auc = roc_auc_score(all_labels, all_probs) if len(np.unique(all_labels)) > 1 else 0.5
     return acc, auc
 
 
-def evaluate_convolutional(model, dataloader, device):  # CNN evaluation
+def evaluate_cnn(model, dataloader, device):
     model.eval()
     all_preds, all_probs, all_labels = [], [], []
     with torch.no_grad():
