@@ -4,15 +4,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
-from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+from sklearn.metrics import pairwise_distances
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, global_mean_pool
 
 from utilities.utils import get_n_ROI, vec_to_symmetric_matrix
 from utilities.train_utils import set_seed, load_dataset, \
-    build_dataloaders, make_class_weight, evaluate_graph, \
+    build_dataloaders, make_class_weight, evaluate_gcn, \
     cross_validation_control, save_model
+
 
 
 def run(config, dataset_name: list, date_str: str):
@@ -31,10 +32,21 @@ def run(config, dataset_name: list, date_str: str):
     set_seed(seed)
     learning_plot = train_config["learning_plot"]
     
-    mode = model_config.get("edge_mode", "full") # graph edge connectivity mode
     k = model_config.get("k", None) # number of neighbors to keep connected to each node
-    threshold = model_config.get("threshold", 0.5) # minimum edge weight to keep
-    print(f"Graph connectivity mode: {mode}, (k={k} neighbours, threshold={threshold} if applicable)")
+    
+    # node-level (nodes = time points, one graph per subject, edges = similarity between time points) 
+    # or graph-level (nodes = ROI, one graph per dFC time point) classification
+    node_level = model_config.get("node_level", True) 
+
+    if node_level:
+        sigma = model_config.get("sigma", None) # Gaussian rbf kernel width for edge weights. 
+                            # Larger = more smoothing = more global connections.
+        sigma = None if sigma in [None, "None"] else float(sigma)
+        print(f"Performing NODE-LEVEL classification with k={k} neighbours and sigma={sigma}.")
+    else:
+        mode = model_config.get("edge_mode", "full") # graph edge connectivity mode
+        threshold = model_config.get("threshold", 0.5) # minimum edge weight to keep
+        print(f"Performing GRAPH-LEVEL classification; Graph connectivity mode: {mode}, (k={k} neighbours, threshold={threshold} if applicable)")
 
 
     ########################## 1. Load dataset #################################
@@ -44,93 +56,204 @@ def run(config, dataset_name: list, date_str: str):
     
     
     ########################## 2. Graph Conversion #############################
-    def dfc_to_graph(dfc_matrix, label):
-        """
-        Convert a dFC matrix into a graph with configurable connectivity.
+    if node_level:
+        def gaussian_kernel_similarity(X, sigma=None):
+            """
+            Compute Gaussian kernel (RBF) similarity matrix from feature matrix X.
 
-        Args:
-            dfc_matrix (ndarray): Dynamic FC matrix (ROI, ROI).
-            label (int/float): Binary graph=dFC matrix label y.
-        """
-        num_nodes = dfc_matrix.shape[0] # equal to number of ROIs
-        
-        # Min–max normalization. Else, dFC values range from 1 to thousands, skewing training.
-        min_val = dfc_matrix.min()
-        max_val = dfc_matrix.max()
-        if max_val > min_val:  # avoid division by zero if all values in matrix are equal
-            dfc_matrix = (dfc_matrix - min_val) / (max_val - min_val)
-        else:
-            dfc_matrix = np.zeros_like(dfc_matrix)
-        
-        # All nodes start with identical feature
-        x = torch.ones((num_nodes, 1), dtype=torch.float)
-        
-        # Edge construction
-        edge_list = []
-        if mode == "full":
-            edge_list = [(i, j) for i in range(num_nodes) for j in range(num_nodes) if i != j]
+            Args:
+                X (ndarray): Shape (num_nodes, num_features)
+                sigma (float): Kernel width parameter. If None, set to median of non-zero distances.
 
-        elif mode == "knn":
-            if k is None:
-                raise ValueError("A value for k must be specified for knn mode. See config.yaml")
-            for i in range(num_nodes):
-                # k+1 because the node itself will have the highest correlation (1.0)
-                neighbors = torch.topk(torch.tensor(dfc_matrix[i]), k+1).indices.tolist()
-                neighbors = [j for j in neighbors if j != i][:k]  # exclude self-loop
+            Returns:
+                A (ndarray): Symmetric similarity matrix (num_nodes, num_nodes)
+            """
+            D = pairwise_distances(X, metric='euclidean')   # sqrt(L2 distances) as basic edge similarity
+            if sigma is None:
+                sigma = np.median(D[D > 0])  # avoid 0s on diagonal = self-distances
+                # print(f"Sigma not provided; using median distance = {sigma:.3f}")
+            A = np.exp(-D**2 / (2 * sigma**2))
+            return A
+
+
+        def subj_to_graph(X_subj, y_subj):
+            """
+            Build a graph for one subject, where nodes = timepoints.
+
+            Args:
+                X_subj (ndarray): (T, num_features), vectorized dFCs for a single subject
+                y_subj (ndarray): (T,), labels per timepoint
+
+            Returns:
+                Data: PyG graph for one subject
+            """
+            T = len(X_subj) # number of timepoints = number of nodes
+            
+            # Min–max normalization. Else, dFC values range from 1 to thousands, skewing training.
+            # Note that min and max are computed per subject here since they are the same 
+            # across timepoints (each ranked dFC matrix).
+            min_val = X_subj.min()
+            max_val = X_subj.max()
+            if max_val > min_val:  # avoid division by zero if all values are equal
+                X_subj = (X_subj - min_val) / (max_val - min_val)
+            else:
+                X_subj = np.zeros_like(X_subj)
+
+            # 1. Compute Gaussian kernel similarity between nodes = timepoints
+            A = gaussian_kernel_similarity(X_subj, sigma=sigma)
+
+            # 2. Sparsify using k-nearest neighbors
+            edge_list = []
+            for i in range(T):
+                neighbors = np.argsort(A[i])[-(k+1):]  # top k+1 (self included); argsort gives ascending order
+                neighbors = [j for j in neighbors if j != i][-k:]   # exclude self-loop
                 edge_list.extend([(i, j) for j in neighbors])
+            # Make symmetric = undirected (optional)
+            edge_list = list(set(edge_list + [(j, i) for (i, j) in edge_list]))
 
-        elif mode == "threshold":
-            edge_list = [(i, j) for i in range(num_nodes) for j in range(num_nodes) 
-                        if i != j and dfc_matrix[i, j] >= threshold]
+            edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+            edge_weights = torch.tensor([A[i, j] for (i, j) in edge_list], dtype=torch.float)
 
-        else:
-            raise ValueError("mode must be 'full', 'knn', or 'threshold'")
+            # 3. Convert to PyTorch Geometric Data object
+            x = torch.tensor(X_subj, dtype=torch.float) # node features = dFC vectors at each timepoint
+            y = torch.tensor(y_subj, dtype=torch.float) # Shape: (num_nodes,)
 
-        # PyG expects edge_index to be shape (2, num_edges)
-        edge_index = torch.tensor(edge_list, dtype=torch.long).t()
-        edge_weights = torch.tensor(    # only keep weights for edges that exist
-            [dfc_matrix[i, j] for (i, j) in edge_list], dtype=torch.float
-        )
-
-        return Data(
-            x=x,
-            edge_index=edge_index,
-            edge_attr=edge_weights,
-            y=torch.tensor([label], dtype=torch.float),
-        )
+            return Data(x=x, edge_index=edge_index, edge_attr=edge_weights, y=y)
 
 
-    class dFCGraphDataset(Dataset):
-        def __init__(self, X, y):
+        class NodeLevelGraph(Dataset):
+            def __init__(self, X, y, subj_label):
+                """
+                Build subject-level graphs for all subjects in dataset.
+
+                Args:
+                    X (ndarray): (N, num_features), all vectorized dFC matrices
+                    y (ndarray): (N,), task presence labels
+                    subj_label (ndarray): (N,), subject index for each sample
+                """
+                self.subjects = np.unique(subj_label)
+                self.graphs = []
+
+                # Pre-build all graphs, one per subject
+                for subj in self.subjects:
+                    subj_mask = subj_label == subj
+                    X_subj = X[subj_mask]
+                    y_subj = y[subj_mask]
+                    subj_graph = subj_to_graph(X_subj, y_subj)
+                    self.graphs.append(subj_graph)
+
+            def __len__(self):
+                return len(self.graphs)
+
+            def __getitem__(self, idx): # get graph for one subject
+                return self.graphs[idx]
+
+        # Build PyG dataset
+        dataset = NodeLevelGraph(X, y, subj_label)
+    
+    
+    else:
+        def dfc_to_graph(dfc_matrix, label):
             """
-            Parameters:
-                X: 2D numpy array of shape (n_samples, num_features)
-                y: 1D array-like of binary labels
+            Convert a dFC matrix into a graph with configurable connectivity.
+
+            Args:
+                dfc_matrix (ndarray): Dynamic FC matrix (ROI, ROI).
+                label (int/float): Binary graph=dFC matrix label y.
+                
+            Returns:
+                Data: PyG graph for one time point.
             """
-            self.X = X
-            self.y = y
+            num_nodes = dfc_matrix.shape[0] # equal to number of ROIs
+            
+            # Min–max normalization. Else, dFC values range from 1 to thousands, skewing training.
+            min_val = dfc_matrix.min()
+            max_val = dfc_matrix.max()
+            if max_val > min_val:  # avoid division by zero if all values in matrix are equal
+                dfc_matrix = (dfc_matrix - min_val) / (max_val - min_val)
+            else:
+                dfc_matrix = np.zeros_like(dfc_matrix)
+            
+            # All nodes start with identical feature
+            x = torch.ones((num_nodes, 1), dtype=torch.float)
+            
+            # Edge construction
+            edge_list = []
+            if mode == "full":
+                edge_list = [(i, j) for i in range(num_nodes) for j in range(num_nodes) if i != j]
 
-        def __len__(self):
-            return len(self.y)
+            elif mode == "knn":
+                if k is None:
+                    raise ValueError("A value for k must be specified for knn mode. See config.yaml")
+                for i in range(num_nodes):
+                    # k+1 because the node itself will have the highest correlation (1.0)
+                    neighbors = torch.topk(torch.tensor(dfc_matrix[i]), k+1).indices.tolist()
+                    neighbors = [j for j in neighbors if j != i][:k]  # exclude self-loop
+                    edge_list.extend([(i, j) for j in neighbors])
 
-        def __getitem__(self, idx):
-            vec = self.X[idx]
-            label = self.y[idx]
-            dfc_matrix = vec_to_symmetric_matrix(vec, ROI)
-            return dfc_to_graph(dfc_matrix, label)
+            elif mode == "threshold":
+                edge_list = [(i, j) for i in range(num_nodes) for j in range(num_nodes) 
+                            if i != j and dfc_matrix[i, j] >= threshold]
 
-    dataset = dFCGraphDataset(X, y)
+            else:
+                raise ValueError("mode must be 'full', 'knn', or 'threshold'")
+
+            # PyG expects edge_index to be shape (2, num_edges)
+            edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+            edge_weights = torch.tensor(    # only keep weights for edges that exist
+                [dfc_matrix[i, j] for (i, j) in edge_list], dtype=torch.float
+            )
+            y = torch.tensor([label], dtype=torch.float)    # Shape: (1,)
+
+            return Data(x=x, edge_index=edge_index, edge_attr=edge_weights, y=y)
 
 
-    ########################## 3. Build GCN Model ####################################
-    class GCN(nn.Module):   # Basic 2 layer GCN model for graph classification
+        class GraphLevelGraph(Dataset):
+            def __init__(self, X, y):
+                """
+                Parameters:
+                    X: 2D numpy array of shape (n_samples, num_features)
+                    y: 1D array-like of binary labels
+                """
+                self.X = X
+                self.y = y
+
+            def __len__(self):
+                return len(self.y)
+
+            def __getitem__(self, idx):
+                vec = self.X[idx]
+                label = self.y[idx]
+                dfc_matrix = vec_to_symmetric_matrix(vec, ROI)
+                return dfc_to_graph(dfc_matrix, label)
+
+        dataset = GraphLevelGraph(X, y)
+
+
+    ########################## 3. Build 2-layer GCN Model ####################################
+    class NodeLevelGCN(nn.Module):
+        def __init__(self, in_channels, hidden_dim=32):
+            super().__init__()  # original x shape: (num_nodes, num_features), so in_channels = num_features
+            self.conv1 = GCNConv(in_channels, hidden_dim)
+            self.conv2 = GCNConv(hidden_dim, hidden_dim)
+            self.classifier = nn.Linear(hidden_dim, 1)
+
+        def forward(self, x, edge_index, edge_attr):    # no batch here; one graph per subject
+            x = self.conv1(x, edge_index, edge_weight=edge_attr)
+            x = F.relu(x)
+            x = self.conv2(x, edge_index, edge_weight=edge_attr)
+            x = F.relu(x)
+            return self.classifier(x)
+
+
+    class GraphLevelGCN(nn.Module):
         def __init__(self, hidden_dim=32):
-            super(GCN, self).__init__()
+            super().__init__()
             self.conv1 = GCNConv(1, hidden_dim)
             self.conv2 = GCNConv(hidden_dim, hidden_dim)
             self.classifier = nn.Linear(hidden_dim, 1)
 
-        def forward(self, x, edge_index, edge_attr, batch):
+        def forward(self, x, edge_index, edge_attr, batch): # batch: vector mapping each node to its graph in the batch
             x = self.conv1(x, edge_index, edge_weight=edge_attr)
             x = F.relu(x)
             x = self.conv2(x, edge_index, edge_weight=edge_attr)
@@ -145,25 +268,49 @@ def run(config, dataset_name: list, date_str: str):
         '''
         Train the model for one inner fold of cross-validation. (Hyperparameter tuning)
         Parameters:
-            train_idx: indices for training set
-            val_idx: indices for validation set
+            train_idx: indices for training set based on samples/rows of X
+            val_idx: indices for validation set based on samples/rows of X
             fold: current fold number
             params: dictionary of one combination of training parameters
         '''
-        # Build dataloaders
-        dataloaders = build_dataloaders(
-            dataset,
-            train_idx,
-            test_idx=val_idx,
-            gcn_mode=True,
-            batch_size=params['batch_size']
-        )
+        if node_level:  # Critical to do mapping to unique subject graphs to avoid index errors
+            # Map sample indices to subject indices (not subj id strings)
+            train_subj = np.unique(subj_label[train_idx])
+            val_subj = np.unique(subj_label[val_idx])
+
+            # Now map those subjects back to integer positions in dataset.graphs
+            subj_train_idx = np.array([i for i, subj in enumerate(dataset.subjects) if subj in train_subj])
+            subj_val_idx = np.array([i for i, subj in enumerate(dataset.subjects) if subj in val_subj])
+            
+            # Build dataloaders
+            dataloaders = build_dataloaders(
+                dataset,
+                train_idx=subj_train_idx,
+                test_idx=subj_val_idx,
+                gcn_mode=True,
+                batch_size=params['batch_size'],
+                node_level=node_level
+            )
+
+        else:
+            dataloaders = build_dataloaders(
+                dataset,
+                train_idx,
+                test_idx=val_idx,
+                gcn_mode=True,
+                batch_size=params['batch_size'],
+                node_level=node_level
+            )
         train_loader = dataloaders["train"]
         val_loader = dataloaders["test"]
+        
 
         # Setup device, model, and optimizer
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model = GCN(hidden_dim=params['hidden_dim']).to(device)
+        if node_level:
+            model = NodeLevelGCN(in_channels=X.shape[1], hidden_dim=params["hidden_dim"]).to(device)
+        else:
+            model = GraphLevelGCN(hidden_dim=params["hidden_dim"]).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'], weight_decay=params['weight_decay'])
 
         # Loss function adjusted for class imbalance
@@ -183,8 +330,11 @@ def run(config, dataset_name: list, date_str: str):
                 data.y = data.y.to(device)
                 
                 optimizer.zero_grad()
-                out = model(data.x, data.edge_index, data.edge_attr, data.batch)
-                loss = criterion(out, data.y.unsqueeze(1).float())
+                if node_level:
+                    out = model(data.x, data.edge_index, data.edge_attr)
+                else:
+                    out = model(data.x, data.edge_index, data.edge_attr, data.batch)
+                loss = criterion(out, data.y.view(-1, 1).float())
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
@@ -198,12 +348,16 @@ def run(config, dataset_name: list, date_str: str):
                 with torch.no_grad():
                     for data in val_loader:
                         data = data.to(device)
-                        out = model(data.x, data.edge_index, data.edge_attr, data.batch)
-                        loss = criterion(out, data.y.unsqueeze(1).float())
+                        if node_level:
+                            out = model(data.x, data.edge_index, data.edge_attr)
+                        else:
+                            out = model(data.x, data.edge_index, data.edge_attr, data.batch)
+                        loss = criterion(out, data.y.view(-1, 1).float())
                         val_loss += loss.item()
                 val_losses.append(val_loss / len(val_loader))
 
-        _, val_auc = evaluate_graph(model, val_loader, device)
+
+        _, val_auc = evaluate_gcn(model, val_loader, device, node_level=node_level)
 
         if fold == 1 and learning_plot:
             return val_auc, inner_train_losses, val_losses
@@ -215,25 +369,48 @@ def run(config, dataset_name: list, date_str: str):
         Test the model for one fold of cross-validation (includes training on train+val set
         with best hyperparameters found in inner loop for that fold).
         Parameters:
-            train_idx: indices for TRAIN+VAL set
-            test_idx: indices for test set
+            train_idx: indices for TRAIN+VAL set based on rows of X
+            test_idx: indices for test set based on rows of X
             fold: current outer fold number
             params: dictionary of one combination of training parameters
         '''
-        # Build dataloaders
-        dataloaders = build_dataloaders(
-            dataset,
-            train_idx,
-            test_idx,
-            gcn_mode=True,
-            batch_size=params['batch_size']
-        )
+        if node_level:
+            # Map sample indices to subject indices (not subj id strings)
+            train_subj = np.unique(subj_label[train_idx])
+            test_subj = np.unique(subj_label[test_idx])
+
+            # Now map those subjects back to integer positions in dataset.graphs
+            subj_train_idx = np.array([i for i, subj in enumerate(dataset.subjects) if subj in train_subj])
+            subj_test_idx = np.array([i for i, subj in enumerate(dataset.subjects) if subj in test_subj])
+            
+            # Build dataloaders
+            dataloaders = build_dataloaders(
+                dataset,
+                train_idx=subj_train_idx,
+                test_idx=subj_test_idx,
+                gcn_mode=True,
+                batch_size=params['batch_size'],
+                node_level=node_level
+            )
+
+        else:
+            dataloaders = build_dataloaders(
+                dataset,
+                train_idx,
+                test_idx,
+                gcn_mode=True,
+                batch_size=params['batch_size'],
+                node_level=node_level
+            )
         train_loader = dataloaders["train"]
         test_loader = dataloaders["test"]
 
         # Setup device, model, and optimizer
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model = GCN(hidden_dim=params['hidden_dim']).to(device)
+        if node_level:
+            model = NodeLevelGCN(in_channels=X.shape[1], hidden_dim=params["hidden_dim"]).to(device)
+        else:
+            model = GraphLevelGCN(hidden_dim=params["hidden_dim"]).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'], weight_decay=params['weight_decay'])
 
         # Loss function adjusted for class imbalance
@@ -253,8 +430,11 @@ def run(config, dataset_name: list, date_str: str):
                 data.y = data.y.to(device)
                 
                 optimizer.zero_grad()
-                out = model(data.x, data.edge_index, data.edge_attr, data.batch)
-                loss = criterion(out, data.y.unsqueeze(1).float())
+                if node_level:
+                    out = model(data.x, data.edge_index, data.edge_attr)
+                else:
+                    out = model(data.x, data.edge_index, data.edge_attr, data.batch)
+                loss = criterion(out, data.y.view(-1, 1).float())
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
@@ -270,12 +450,15 @@ def run(config, dataset_name: list, date_str: str):
                 with torch.no_grad():
                     for data in test_loader:
                         data = data.to(device)
-                        out = model(data.x, data.edge_index, data.edge_attr, data.batch)
-                        loss = criterion(out, data.y.unsqueeze(1).float())
+                        if node_level:
+                            out = model(data.x, data.edge_index, data.edge_attr)
+                        else:
+                            out = model(data.x, data.edge_index, data.edge_attr, data.batch)
+                        loss = criterion(out, data.y.view(-1, 1).float())
                         test_loss += loss.item()
                 test_losses.append(test_loss / len(test_loader))
 
-        acc, auc = evaluate_graph(model, test_loader, device)
+        acc, auc = evaluate_gcn(model, test_loader, device, node_level=node_level)
 
         if fold == 1 and learning_plot:
             return acc, auc, outer_train_losses, test_losses
@@ -293,7 +476,8 @@ def run(config, dataset_name: list, date_str: str):
         model_name="GCN", 
         dataset_name=dataset_name,
         date_str=date_str,
-        seed=seed)
+        seed=seed
+        )
     
     
     ########################## 6. Optional Retrain on Full Dataset #########################
@@ -301,7 +485,10 @@ def run(config, dataset_name: list, date_str: str):
         full_loader = DataLoader(dataset, batch_size=best_params['batch_size'], shuffle=True)
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        final_model = GCN(hidden_dim=best_params['hidden_dim']).to(device)
+        if node_level:
+            final_model = NodeLevelGCN(in_channels=X.shape[1], hidden_dim=best_params["hidden_dim"]).to(device)
+        else:
+            final_model = GraphLevelGCN(hidden_dim=best_params["hidden_dim"]).to(device)
         optimizer = torch.optim.Adam(final_model.parameters(), lr=best_params['lr'], weight_decay=best_params['weight_decay'])
         pos_weight = make_class_weight(y, device)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -314,8 +501,11 @@ def run(config, dataset_name: list, date_str: str):
                 data.edge_attr = data.edge_attr.to(device)
                 data.y = data.y.to(device)
                 optimizer.zero_grad()
-                out = final_model(data.x, data.edge_index, data.edge_attr, data.batch)
-                loss = criterion(out, data.y.unsqueeze(1))
+                if node_level:
+                    out = final_model(data.x, data.edge_index, data.edge_attr)
+                else:
+                    out = final_model(data.x, data.edge_index, data.edge_attr, data.batch)
+                loss = criterion(out, data.y.view(-1, 1).float())
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()

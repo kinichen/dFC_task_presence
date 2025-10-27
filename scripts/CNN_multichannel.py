@@ -11,7 +11,7 @@ import torch.optim as optim
 import os
 from utilities.utils import get_n_ROI, vec_to_symmetric_matrix, harmonize_TR
 from utilities.train_utils import set_seed, \
-    build_dataloaders, make_class_weight, evaluate_convolutional, \
+    build_dataloaders, make_class_weight, evaluate_cnn, \
     cross_validation_control, save_model
 
 
@@ -203,7 +203,7 @@ def run(config, dataset_names: list, date_str: str):
                 val_losses.append(val_loss / len(val_loader))
 
         # Validation evaluation
-        _, val_auc = evaluate_convolutional(model, val_loader, device)
+        _, val_auc = evaluate_cnn(model, val_loader, device)
         
         if fold == 1 and learning_plot:
             return val_auc, inner_train_losses, val_losses
@@ -286,7 +286,7 @@ def run(config, dataset_names: list, date_str: str):
                 test_losses.append(test_loss / len(test_loader))
 
         # Test evaluation
-        acc, auc = evaluate_convolutional(model, test_loader, device)
+        acc, auc = evaluate_cnn(model, test_loader, device)
 
         if fold == 1 and learning_plot:
             return acc, auc, outer_train_losses, test_losses
