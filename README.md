@@ -1,2 +1,2 @@
 # dFC_task_presence
-Project to improve classification of task vs. rest time points using dynamic functional connectivity
+Project to investigate deep learning architectures for improving the binary classification of rest vs task timepoints using dynamic functional connectivity (dFC). We have sub-datasets of subjects' dFC matrix time series assessed by three dFC assessment methods (Sliding Window, Time-Frequency, and Co-activation Patterns) across four specific task paradigms from a task-based fMRI dataset from the OpenNeuro repository.
