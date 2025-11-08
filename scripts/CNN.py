@@ -231,9 +231,9 @@ def run(config, dataset_name: list, date_str: str):
         if "resnet" in model_config['name']:
             in_features = model.fc.in_features
             model.fc = nn.Sequential(
-                nn.BatchNorm1d(in_features),
+        #        nn.BatchNorm1d(in_features),
                 nn.ReLU(),
-                nn.Dropout(p=0.3),  # % of neurons are deactivated 
+                nn.Dropout(p=params['dropout']),  # % of neurons are deactivated 
                     # each forward pass to enhance robustness/regularization
                 nn.Linear(in_features, 1)   # binary classification
             )
@@ -241,9 +241,9 @@ def run(config, dataset_name: list, date_str: str):
         elif "efficientnet" in model_config['name']:
             in_features = model.classifier.in_features
             model.classifier = nn.Sequential(
-                nn.BatchNorm1d(in_features),
+        #        nn.BatchNorm1d(in_features),
                 nn.ReLU(),
-                nn.Dropout(p=0.3),
+                nn.Dropout(p=params['dropout']),
                 nn.Linear(in_features, 1)
             )
 
@@ -349,18 +349,18 @@ def run(config, dataset_name: list, date_str: str):
         if "resnet" in model_config['name']:
             in_features = model.fc.in_features
             model.fc = nn.Sequential(
-                nn.BatchNorm1d(in_features), # normalize inputs to final fc layer for stable activations
+        #        nn.BatchNorm1d(in_features), # normalize inputs to final fc layer for stable activations
                 nn.ReLU(),
-                nn.Dropout(p=0.3),
+                nn.Dropout(p=params['dropout']),  # % of neurons are deactivated
                 nn.Linear(in_features, 1)
             )
 
         elif "efficientnet" in model_config['name']:
             in_features = model.classifier.in_features
             model.classifier = nn.Sequential(
-                nn.BatchNorm1d(in_features),
+        #        nn.BatchNorm1d(in_features),
                 nn.ReLU(),
-                nn.Dropout(p=0.3),
+                nn.Dropout(p=params['dropout']),
                 nn.Linear(in_features, 1)
             )
 
@@ -463,7 +463,7 @@ def run(config, dataset_name: list, date_str: str):
         if "resnet" in model_config['name']:
             in_features = final_model.fc.in_features
             final_model.fc = nn.Sequential(
-                nn.Dropout(p=0.5),  # 50% of neurons are deactivated 
+                nn.Dropout(p=best_params['dropout']),  # % of neurons are deactivated 
                     # each forward pass to enhance robustness/regularization
                 nn.Linear(in_features, 1)   # binary classification
             )
@@ -471,14 +471,14 @@ def run(config, dataset_name: list, date_str: str):
         elif "efficientnet" in model_config['name']:
             in_features = final_model.classifier.in_features
             final_model.classifier = nn.Sequential(
-                nn.Dropout(p=0.5),
+                nn.Dropout(p=best_params['dropout']),
                 nn.Linear(in_features, 1)
             )
 
         else:
             raise ValueError(f"Unsupported pretrained model: {model_config['name']}")
         
-        
+        '''
         # Freeze backbone except the final fully connected layer for fine-tuning (only
         # update final layer's weights and the rest are from pretraining)
         # Reduces overfitting risk on small datasets and speeds up training
@@ -488,6 +488,7 @@ def run(config, dataset_name: list, date_str: str):
                 param.requires_grad = True
             else:
                 param.requires_grad = False
+        '''
         
         final_model.to(device)
         optimizer = torch.optim.AdamW(      # AdamW is Adam with weight decay applied to weights instead of gradients (decoupled)

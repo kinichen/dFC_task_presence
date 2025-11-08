@@ -1,13 +1,78 @@
-#### OUT Of DATE  ###
+############################# Model configurations ################################
 
+# Training configuration based on model
+models:
+  CNN:
+    name: efficientnet_b0 # any timm model name, e.g., "resnet18", "efficientnet_b0"
+    training:
+      seed: 42
+      dropout: 0.5
+      batch_size: [16, 32]  # larger batch size reduces stochasticity
+      lr: [0.0001, 0.001]  # try smaller learning rate for pre-trained models
+      weight_decay: [0.0001, 0.001] # L2 regularization for Adam(W) optimizer
+      epochs: 10
+      outer_folds: 5
+      inner_folds: 3  # for hyperparameter tuning
+      learning_plot: False  # whether to save losses for plotting learning curves
+      retrain_full_dataset: False   # retrain on entire dataset after CV to save a final model
+    output_dir: "saved_models/CNN"
+
+  GCN:
+    node_level: False    # switch between graph architectures (node-level or graph-level classification)
+    k: 20               # only for knn graph or node-level classification for sparsification
+    sigma: 1        # only for rbf kernel when node_level: true. 
+                      # if None, uses median pairwise distance heuristic: sigma = around 20-25.
+    edge_mode: "knn"  # how to construct graph edges. "full", "knn" or "threshold"
+    threshold: 0.5      # only for threshold graph
+    training:
+      seed: 42
+      dropout: 0.2
+      hidden_dim: [16, 32]  # only for not pre-trained models
+      batch_size: [16, 32]
+      lr: [0.0005, 0.001]
+      weight_decay: [0.0001, 0.001]
+      epochs: 100
+      outer_folds: 5
+      inner_folds: 3
+      learning_plot: True
+      retrain_full_dataset: False
+    output_dir: "saved_models/GCN"
+
+
+################################ Dataset paths ####################################
 datasets:
-  sim_timefreq:  # simulated dFC dataset assessed by time frequency method
-    path: "~/projects/dFC_task_presence/Datasets/Simulated_data/ds000002_task-lowFreqLongRest_Time-Freq.npy"
+  axcpt_cap:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Axcpt_CAP.npy"
   
-  real_timefreq: 
-    path: "~/projects/dFC_task_presence/Datasets/ds003465_task-Axcpt_Time-Freq.npy"
-  
-  atlas_real: 
-    path: "~/projects/dFC_task_presence/Datasets/atlas_data.npy"
+  axcpt_sw:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Axcpt_SlidingWindow.npy"
 
-  # training: # May add training hyperparameters here later
+  axcpt_tf:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Axcpt_Time-Freq.npy"
+
+  cuedts_cap:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Cuedts_CAP.npy"
+  
+  cuedts_sw:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Cuedts_SlidingWindow.npy"
+  
+  cuedts_tf:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Cuedts_Time-Freq.npy"
+  
+  stern_cap:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Stern_CAP.npy"
+  
+  stern_sw:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Stern_SlidingWindow.npy"
+
+  stern_tf:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Stern_Time-Freq.npy"
+  
+  stroop_cap:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Stroop_CAP.npy"
+  
+  stroop_sw:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Stroop_SlidingWindow.npy"
+  
+  stroop_tf:
+    path: "~/projects/dFC_task_presence/Datasets/real_data/ds003465_task-Stroop_Time-Freq.npy"
