@@ -1,15 +1,17 @@
 import numpy as np
 import random
 import os
-from sklearn.model_selection import StratifiedGroupKFold
-from torch.utils.data import DataLoader, Subset
-from itertools import product  # for grid expansion
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 from datetime import datetime
+
+from sklearn.model_selection import StratifiedGroupKFold
+from torch.utils.data import DataLoader, Subset # CNN dataloader
+from torch_geometric.loader import DataLoader as GraphLoader  # GCN dataloader
+from itertools import product  # for grid expansion
 
 
 def set_seed(seed):
@@ -67,8 +69,8 @@ def build_dataloaders(dataset, train_idx, test_idx, gcn_mode, batch_size, node_l
         else:
             # Each sample = one dFC matrix (small graph with num_nodes = num_ROIs)
             # Can batch multiple graphs using PyG DataLoader
-            train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-            test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+            train_loader = GraphLoader(train_set, batch_size=batch_size, shuffle=True)
+            test_loader = GraphLoader(test_set, batch_size=batch_size, shuffle=False)
 
         return {"train": train_loader, "test": test_loader}
 
@@ -157,6 +159,13 @@ def cross_validation_control(X, y, subj_label, train_config, train_one_fold,
     param_grid = expand_param_grid(train_config)
     best_fold_one_params = None # to store best params from first outer fold
     learning_plot = train_config.get('learning_plot', False)
+    
+    level_name = "node-level_GCN" if train_config.get("node_level", True) else "graph-level_GCN"
+    if model_name == "CNN":
+        save_subdir = model_name
+    else:
+        save_subdir = level_name
+    
     acc_scores, auc_scores = [], []
     total_inner_train_losses, total_val_losses = [], [] # for fold 1
     fold = 1    # iterate over number of outer folds for logging purposes
@@ -190,6 +199,7 @@ def cross_validation_control(X, y, subj_label, train_config, train_one_fold,
                 
                 param_val_aucs.append(val_auc)
             # since dictionary keys must be immutable, convert params dict to sorted tuple of tuples
+            # Tune based on mean validation AUC across inner folds for more stable best params
             val_aucs[tuple(sorted(params.items()))] = np.mean(param_val_aucs)
             
         best_val_auc = max(val_aucs.values())
@@ -202,7 +212,7 @@ def cross_validation_control(X, y, subj_label, train_config, train_one_fold,
             acc, auc, outer_train_losses, test_losses = test_one_fold(
                 trainval_idx, test_idx, fold, params=best_params
             )
-            save_dir = os.path.join("saved_performances", model_name, "losses", date_str)
+            save_dir = os.path.join("saved_performances", save_subdir, "losses", date_str)
             os.makedirs(save_dir, exist_ok=True)
 
             np.save(os.path.join(save_dir, f"inner_train_losses_{dataset_name}.npy"),
@@ -227,7 +237,8 @@ def cross_validation_control(X, y, subj_label, train_config, train_one_fold,
         fold += 1
     
     # Save metrics per outer fold and print overall metrics
-    save_dir = os.path.join("saved_performances", model_name, "metrics", date_str)
+    save_dir = os.path.join("saved_performances", save_subdir, "metrics", date_str)
+
     os.makedirs(save_dir, exist_ok=True)
     np.save(os.path.join(save_dir, f"acc_{dataset_name}.npy"), 
             np.round(np.array(acc_scores, dtype=float), decimals=4))

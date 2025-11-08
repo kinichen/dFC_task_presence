@@ -232,32 +232,41 @@ def run(config, dataset_name: list, date_str: str):
 
     ########################## 3. Build 2-layer GCN Model ####################################
     class NodeLevelGCN(nn.Module):
-        def __init__(self, in_channels, hidden_dim=32):
+        def __init__(self, in_channels, hidden_dim=32, dropout=0.5):
             super().__init__()  # original x shape: (num_nodes, num_features), so in_channels = num_features
             self.conv1 = GCNConv(in_channels, hidden_dim)
             self.conv2 = GCNConv(hidden_dim, hidden_dim)
             self.classifier = nn.Linear(hidden_dim, 1)
+            # self.dropout = dropout
 
         def forward(self, x, edge_index, edge_attr):    # no batch here; one graph per subject
             x = self.conv1(x, edge_index, edge_weight=edge_attr)
             x = F.relu(x)
+            # x = F.dropout(x, p=self.dropout, training=self.training)  # Dropout after activation
+
             x = self.conv2(x, edge_index, edge_weight=edge_attr)
             x = F.relu(x)
+            # x = F.dropout(x, p=self.dropout, training=self.training)
             return self.classifier(x)
 
 
     class GraphLevelGCN(nn.Module):
-        def __init__(self, hidden_dim=32):
+        def __init__(self, hidden_dim=32, dropout=0.5):
             super().__init__()
             self.conv1 = GCNConv(1, hidden_dim)
             self.conv2 = GCNConv(hidden_dim, hidden_dim)
             self.classifier = nn.Linear(hidden_dim, 1)
+            # self.dropout = dropout
 
         def forward(self, x, edge_index, edge_attr, batch): # batch: vector mapping each node to its graph in the batch
             x = self.conv1(x, edge_index, edge_weight=edge_attr)
             x = F.relu(x)
+            # x = F.dropout(x, p=self.dropout, training=self.training)
+
             x = self.conv2(x, edge_index, edge_weight=edge_attr)
             x = F.relu(x)
+            # x = F.dropout(x, p=self.dropout, training=self.training)
+
             x = global_mean_pool(x, batch)  # pooling: graph-level embeddings. 
                                             # Shape: (num_graphs, hidden_dim)
             return self.classifier(x)
@@ -308,9 +317,9 @@ def run(config, dataset_name: list, date_str: str):
         # Setup device, model, and optimizer
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if node_level:
-            model = NodeLevelGCN(in_channels=X.shape[1], hidden_dim=params["hidden_dim"]).to(device)
+            model = NodeLevelGCN(in_channels=X.shape[1], hidden_dim=params["hidden_dim"], dropout=params["dropout"]).to(device)
         else:
-            model = GraphLevelGCN(hidden_dim=params["hidden_dim"]).to(device)
+            model = GraphLevelGCN(hidden_dim=params["hidden_dim"], dropout=params["dropout"]).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'], weight_decay=params['weight_decay'])
 
         # Loss function adjusted for class imbalance
@@ -486,9 +495,9 @@ def run(config, dataset_name: list, date_str: str):
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if node_level:
-            final_model = NodeLevelGCN(in_channels=X.shape[1], hidden_dim=best_params["hidden_dim"]).to(device)
+            final_model = NodeLevelGCN(in_channels=X.shape[1], hidden_dim=best_params["hidden_dim"], dropout=best_params["dropout"]).to(device)
         else:
-            final_model = GraphLevelGCN(hidden_dim=best_params["hidden_dim"]).to(device)
+            final_model = GraphLevelGCN(hidden_dim=best_params["hidden_dim"], dropout=best_params["dropout"]).to(device)
         optimizer = torch.optim.Adam(final_model.parameters(), lr=best_params['lr'], weight_decay=best_params['weight_decay'])
         pos_weight = make_class_weight(y, device)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)

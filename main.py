@@ -45,12 +45,12 @@ def main(script, dataset_name, date_str, description="None"):
 if __name__ == "__main__":
     ######################### CHANGE THIS FOR RUNS ############################
     script = "CNN"  # CNN or GCN (if want multichannel, set script = "CNN"; dataset_name = list of 3 datasets)
+    run_whole_paradigm = True   # Set to False to submit job for only one dataset (non-CNN_multichannel)
     dataset_name = ["axcpt_tf"]  # Multichannel e.g. ["stern_sw", "stern_tf", "stern_cap"]; Single e.g. ["axcpt_cap"]
-    run_whole_paradigm = False   # Set to False to submit job for only one dataset (non-CNN_multichannel)
-    description = "Resnet18, AdamW, No freezing, Dropout=0.3, 3 outer CV folds, batchnorm before classifier"
+    description = "Preprint: EfficientNet reg. (weight decay + dropout = 0.5), epochs=10, batch_size: [16, 32]."
     
     # *** Version of the performance output. Must change to avoid overwriting previous results ***
-    date_str = "20251010"
+    date_str = "20251106"
     ############################################################################
 
     if len(dataset_name) == 3:
@@ -61,5 +61,5 @@ if __name__ == "__main__":
         main(script, dataset_name, date_str, description)
         
     else: # For GCN and single-channel CNN, loop through all method datasets of one paradigm for job submission convenience
-        for dataset in [["stroop_sw"], ["stroop_tf"], ["stroop_cap"]]:
+        for dataset in [["stroop_tf"], ["stroop_sw"], ["stroop_cap"]]:
             main(script, dataset, date_str, description)
